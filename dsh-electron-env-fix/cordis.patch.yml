@@ -1,0 +1,20 @@
+# ============================================================================
+# dsh-electron-env-fix —— DSH bundle patch
+# ============================================================================
+# 在 host 组合里挂一行本地插件，用于清除 host 进程里被污染的
+# ELECTRON_RUN_AS_NODE 环境变量（详见 lib/index.js 的说明）。
+#
+# 装到哪个 profile 就只影响哪个 profile：
+#   · 桌面端（desktop profile）—— 需要它，这是本插件存在的理由；
+#   · Web 端（web profile）—— host 由普通 node 启动，本来就没有这个变量，
+#     装了也不会做任何事（apply 里会检测到 undefined 直接跳过）。
+#
+# 安装：
+#   dsh plugin --profile <name> add link:dsh-electron-env-fix
+# 卸载：
+#   dsh plugin --profile <name> remove dsh-electron-env-fix
+# ============================================================================
+
+- insert:
+    - id: dsh-electron-env-fix
+      name: dsh-electron-env-fix

@@ -1,0 +1,27 @@
+{
+  "name": "dsh-rimcrow-tools",
+  "version": "1.1.0",
+  "description": "把 RimCrow 的 7 个 AI 模组工具注册为 DSH 模型工具（当前启用列表、模组规则、模组元数据、搜索模组、分组模组、模组用户数据、日志上下文），全部只读访问 RimCrow / RimWorld 数据。",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "rimworld",
+    "rimcrow",
+    "mods"
+  ],
+  "type": "module",
+  "main": "lib/index.js",
+  "files": [
+    "lib",
+    "data",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "license": "MIT"
+}

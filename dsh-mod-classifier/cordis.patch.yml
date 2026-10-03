@@ -1,0 +1,17 @@
+# ============================================================================
+# dsh-mod-classifier —— DSH bundle patch
+# ============================================================================
+# 把模组分类器工具集挂进 web profile 的宿主组合层。
+#
+# 安装方式（源码在 ~/.dsh/external/dsh-mod-classifier，不受工作区清理影响）：
+#   dsh plugin --profile web add link:dsh-mod-classifier
+# 卸载方式：
+#   dsh plugin --profile web remove dsh-mod-classifier
+#
+# 该行注册在宿主组合（host composition），因此**所有预设、所有会话**都能调用。
+# 提供的工具：mod_classify_scan / mod_classify_check / mod_classify_explain / mod_classify_rules
+# ============================================================================
+
+- insert:
+    - id: dsh-mod-classifier
+      name: dsh-mod-classifier

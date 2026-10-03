@@ -1,0 +1,15 @@
+{
+  "name": "dsh-mod-classifier",
+  "version": "1.0.0",
+  "description": "把 RimWorld 模组分类器注册为 DSH 模型工具：全库扫描归类、按内容校验归类是否正确、单模组诊断、分类规则维护。只读访问 RimCrow 数据，改 RimCrow 仍走官方 MCP 工具。",
+  "keywords": ["dsh", "dsh-plugin", "deepseek-harness", "rimworld", "rimcrow", "mods", "classifier"],
+  "type": "module",
+  "main": "lib/index.js",
+  "files": ["lib", "data", "rules", "cordis.patch.yml", "README.md"],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "license": "MIT"
+}

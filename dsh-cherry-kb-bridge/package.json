@@ -1,0 +1,15 @@
+{
+  "name": "dsh-cherry-kb-bridge",
+  "version": "0.1.0",
+  "description": "把 Cherry Studio 本地知识库桥接为 DSH 模型工具（知识库列表、FTS 全文检索、原文读取），全部只读访问 Cherry Studio 数据。",
+  "keywords": ["dsh", "dsh-plugin", "deepseek-harness", "cherry-studio", "knowledge-base"],
+  "type": "module",
+  "main": "lib/index.js",
+  "files": ["lib", "data", "cordis.patch.yml", "README.md"],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "license": "MIT"
+}

@@ -1,0 +1,17 @@
+# ============================================================================
+# dsh-rimcrow-tools —— DSH bundle patch
+# ============================================================================
+# 把 RimCrow 模组助手工具集挂进 web profile 的宿主组合层。
+#
+# 安装方式：
+#   dsh plugin --profile web add link:dsh-rimcrow-tools
+# 卸载方式：
+#   dsh plugin --profile web remove dsh-rimcrow-tools
+#
+# 该行注册在宿主组合（host composition）里，因此**所有预设、所有会话**
+# 都能调用这 7 个工具。
+# ============================================================================
+
+- insert:
+    - id: dsh-rimcrow-tools
+      name: dsh-rimcrow-tools
