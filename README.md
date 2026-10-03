@@ -13,12 +13,12 @@
 
 ## 安装
 
-用 DSH 的 `plugin_manager` 以本地目录安装（把 `<插件目录>` 换成本仓库中对应插件的绝对路径）：
+用 DSH 的 `plugin_manager` 以本地目录安装 —— 把下方 `<插件目录>` 换成本仓库中对应插件的**绝对路径**：
 
-```
-plugin_manager  action: install_bundle
-                target: <插件目录>
-```
+| 参数 | 值 |
+| --- | --- |
+| `action` | `install_bundle` |
+| `target` | `<插件目录>` |
 
 或者手工登记为 profile 依赖：
 
