@@ -1,5 +1,7 @@
 # GNH · DSH 插件合集
 
+> **📦 下载**：[最新版本（Release）](https://github.com/1579486875/gnh-dsh-plugins/releases/latest) —— 下载 zip 解压得到 5 个独立插件目录。
+
 面向 [DeepSeek Harness (DSH)](https://github.com/deepseek-ai/deepseek-harness) 的一组自研 Host 插件。
 每个插件都是**零依赖**（只用 Node 内置模块）的独立 bundle，可以单独安装，也可以整仓库取用。
 
