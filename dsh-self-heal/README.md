@@ -204,7 +204,7 @@ self-heal: 本轮模型只思考未输出正文，已注入提醒并要求重新
 ```powershell
 cd %USERPROFILE%\.dsh\external\dsh-self-heal
 
-# 1. 单元 + 集成测试（83 个用例）
+# 1. 单元 + 集成测试（86 个用例）
 npm test
 
 # 2. 契约自检：用真实的 DSH 包验证「接口没变、数据合法」（需要本机装有 DSH）
@@ -218,9 +218,14 @@ npm run diagnose
 
 - `npm test` —— 行为对不对（不依赖 DSH，任何机器都能跑）；
 - `npm run contract` —— 依赖的接口还在不在。它会**用官方组装器解析我们伪造的
-  熔断分片**、**用官方 Session 写入我们构造的提醒消息**，再检查官方默认重试
-  白名单里确实没有我们的 code。DSH 升级后先跑它。
+  熔断分片**、**用官方 Session 写入我们构造的提醒消息**、**在真实 Cordis 上下文里
+  把三条链路跑一遍**，再检查官方默认重试白名单里确实没有我们的 code。DSH 升级
+  后先跑它。
 - `npm run diagnose` —— 数字好不好看（触发点、吞吐、误报）。
+
+> 如果 PowerShell 报「`npm.ps1` cannot be loaded because running scripts is
+> disabled on this system」，那是执行策略挡住了解释器包装脚本，改用 `npm.cmd test`
+> 或直接用 node：`node --test test/detect.test.mjs test/integration.test.mjs test/recovery.test.mjs`。
 
 测试覆盖的极端场景（节选）：40 万字符的正常长输出必须完整放行、单个 100 万
 字符的分片、10 万字符的超长单行、空输入与类型不对的分片、上游抛错必须原样
