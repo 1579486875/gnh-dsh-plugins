@@ -1,0 +1,48 @@
+# ============================================================================
+# dsh-self-heal —— DSH bundle patch（告诉 DSH「要把这个插件装进组合里」）
+# ============================================================================
+# 这个文件只有一行真正的内容：把 self-heal 插件插进 host 组合。
+# 上面这些全是给人看的说明，DSH 会忽略以 # 开头的行。
+#
+# 为什么挂在 host 平面（而不是某个 agent 预设）：
+#   自愈要覆盖「所有会话 × 所有子代理 × 所有辅助模型调用（生成标题、压缩
+#   摘要）」里的每一次模型请求，这正是 host 组合的职责范围。放进预设的话，
+#   每个会话各拿一份实例：既覆盖不全，也会在第二次挂载时冲突。
+#
+# 安装（在 profile 目录下执行，或直接改 profiles/<名字>/package.json）：
+#   dsh plugin --profile web add link:dsh-self-heal
+#
+# 调参：
+#   不要改本文件。本行刻意不写 config，好让插件用它自己的默认值；要调整就在
+#   profile 的 cordis.patch.yml 里按 id 覆盖 —— 注意 patch 的语义是「整体替换
+#   config」，不是逐字段合并，所以要重述每一个想保留的字段。
+#
+#   示例（放进 profiles/web/cordis.patch.yml）：
+#     - id: self-heal
+#       config:
+#         enabled: true
+#         maxDurationMs: 1800000
+#         logTrips: true
+#         recover:
+#           enabled: true
+#           maxAttempts: 3
+#           retryWithoutCompaction: true
+#         silentThought:
+#           enabled: true
+#           maxAttempts: 2
+#           maxAgeMs: 300000
+#           message: '[系统自动提醒] 你只输出了思考，请直接把正文写出来。'
+#         repeat:
+#           enabled: true
+#           minChars: 4000
+#
+# 卸载：
+#   1. 删掉 profile 的 cordis.patch.yml 里对应的覆盖行（如果有）；
+#   2. 从 profile 的 package.json 里移除依赖与 dsh.profile.bundles 里的本包名；
+#   3. 删掉 profiles/<名字>/node_modules/dsh-self-heal 这个 junction
+#      （注意删链接，别删到 external 里的源码）。
+# ============================================================================
+
+- insert:
+    - id: self-heal
+      name: dsh-self-heal

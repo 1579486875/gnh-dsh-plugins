@@ -1,12 +1,13 @@
 /**
- * dsh-loop-guard 检测内核自测。
+ * dsh-self-heal 检测内核自测（复读识别）。
  *
  * 运行：node --test test/
  *
- * 测试分三组：
+ * 测试分四组：
  *   1. 不误报 —— 真实形态的正常长输出必须一次都不触发；
  *   2. 必触发 —— 各种形态的复读必须被抓到（含真实事故文本）；
- *   3. 参数自洽 —— 窗口尺寸必须喂得饱两条检测线。
+ *   3. 边界与极端 —— 刚好在门槛上、超长单行、超大单块、空输入；
+ *   4. 性能 —— 每个 token 级分片都要过一遍 push()，所以必须有速度保证。
  */
 
 import test from 'node:test'
@@ -17,7 +18,6 @@ import {
   REPEAT_DEFAULTS,
   createRepeatDetector,
   detectInTail,
-  estimateTokens,
   findRepeatingLineBlock,
   findRepeatingPeriod,
   significantLines,
@@ -114,7 +114,7 @@ test('正常内容不误报：JSON 记录数组', () => {
 })
 
 test('正常内容不误报：代码里的深层缩进与重复括号', () => {
-  // 构造大量 "    }" / "}" 交替 —— 这类低信息量周期必须被 minPatternDistinct 挡掉。
+  // 构造大量 "    }" / "  }" 交替 —— 这类低信息量周期必须被 minPatternDistinct 挡掉。
   const chunks = []
   for (let i = 0; i < 400; i += 1) {
     chunks.push('    ' + '}'.repeat(1 + (i % 3)))
@@ -125,7 +125,7 @@ test('正常内容不误报：代码里的深层缩进与重复括号', () => {
   assert.equal(judge(text), null)
 })
 
-test('正常内容不误报：Markdown 分隔线', () => {
+test('正常内容不误报：Markdown 分隔线与长等号线', () => {
   const text = [
     '# 一级标题',
     '',
@@ -175,8 +175,7 @@ test('必触发：真实事故文本（15 行推理循环 × 6 次）', () => {
 
 test('必触发：单行英文重复 200 次', () => {
   const text = Array.from({ length: 200 }, () => 'Let me run.').join('\n')
-  const hit = judge(text)
-  assert.notEqual(hit, null, '单行复读必须被识别')
+  assert.notEqual(judge(text), null, '单行复读必须被识别')
 })
 
 test('必触发：两行交替 120 轮', () => {
@@ -254,7 +253,7 @@ test('必触发：字符级检测同样容忍末尾偏移', () => {
 })
 
 // ---------------------------------------------------------------------------
-// 3. 边界与参数自洽
+// 3. 边界与极端
 // ---------------------------------------------------------------------------
 
 test('边界：重复次数不足时不触发', () => {
@@ -284,6 +283,56 @@ test('边界：detector 在输出量达标后开始判定', () => {
   assert.notEqual(hit, null)
 })
 
+test('边界：reset() 之后重新开始攒门槛', () => {
+  const detector = createRepeatDetector()
+  const loop = Array.from({ length: 200 }, () => 'Let me run.').join('\n')
+  detector.push(loop)
+  assert.ok(detector.chars() > 0)
+  detector.reset()
+  assert.equal(detector.chars(), 0)
+  // 复位后只喂一点点：不该判定（门槛要重新攒）。
+  assert.equal(detector.push('Let me run.'.repeat(3)), null)
+})
+
+test('极端：单行超长（10 万字符）既不能崩，也不该被当成复读', () => {
+  // 一整行里字符各不相同 —— 没有周期，必须放行。
+  const huge = Array.from({ length: 100000 }, (_, i) => String.fromCharCode(0x4e00 + (i % 2000))).join('')
+  const hit = judge(huge)
+  assert.equal(hit, null, '无周期的超长单行不得判为复读')
+})
+
+test('极端：一次喂入 100 万字符的单个分片', () => {
+  const detector = createRepeatDetector()
+  const text = variedProse(20000)
+  assert.ok(text.length > 900000, '样本应接近或超过 100 万字符，实际 ' + text.length)
+  const hit = detector.push(text)
+  assert.equal(hit, null, '正常长文本不得误判')
+  assert.equal(detector.chars(), text.length)
+})
+
+test('极端：空输入与非法输入一律返回未命中', () => {
+  const detector = createRepeatDetector()
+  assert.equal(detector.push(''), null)
+  assert.equal(detector.push(null), null)
+  assert.equal(detector.push(undefined), null)
+  assert.equal(detector.push(12345), null)
+  assert.equal(detector.chars(), 0, '非法输入不得被计入字符数')
+  assert.equal(findRepeatingPeriod(''), 0)
+  assert.equal(judge(''), null)
+})
+
+test('极端：刚好等于最小周期长度的重复（边界内命中）', () => {
+  const unit = 'abcdefgh' // 正好 minPeriod = 8
+  const text = unit.repeat(REPEAT_DEFAULTS.minRepeats + 2)
+  assert.ok(distinctEnough(unit), '样本周期需满足不同字符数下限')
+  assert.ok(findRepeatingPeriod(text, REPEAT_DEFAULTS) > 0, '正好门槛长的周期也应命中')
+})
+
+test('极端：低信息量周期被刻意放过（不误伤分隔线）', () => {
+  const text = '-'.repeat(REPEAT_DEFAULTS.minChars + 5000)
+  assert.equal(judge(text), null, '纯分隔线不得触发熔断')
+})
+
 test('参数自洽：窗口尺寸喂得饱两条检测线', () => {
   assert.ok(
     REPEAT_DEFAULTS.maxPeriod * REPEAT_DEFAULTS.minRepeats <= REPEAT_DEFAULTS.windowChars,
@@ -301,10 +350,34 @@ test('工具函数：significantLines 会丢掉空行与过短行', () => {
   assert.deepEqual(lines, ['let me run.'])
 })
 
-test('工具函数：estimateTokens 对宽窄字符给出保守估算', () => {
-  assert.equal(estimateTokens(''), 0)
-  assert.equal(estimateTokens('abc'), 1)
-  assert.equal(estimateTokens('hello world'), 3)
-  assert.equal(estimateTokens('你好世界'), 4)
-  assert.ok(estimateTokens('你好世界') > estimateTokens('abcd'), '同长度的中文必须比英文贵')
+// ---------------------------------------------------------------------------
+// 4. 性能
+// ---------------------------------------------------------------------------
+
+test('性能：10 万次小分片 push 必须很快（每个 token 级分片都会调它）', () => {
+  const detector = createRepeatDetector()
+  const piece = '这是一段正常的中文输出片段。'
+  const rounds = 100000
+  const startedAt = Date.now()
+  for (let i = 0; i < rounds; i += 1) detector.push(piece)
+  const elapsed = Date.now() - startedAt
+  // 真实耗时在几十毫秒量级；3 秒是给慢机器留的极宽松上限。
+  assert.ok(elapsed < 3000, '10 万次 push 耗时 ' + elapsed + 'ms，超出预期')
+  assert.equal(detector.chars(), piece.length * rounds)
 })
+
+test('性能：判定一次的代价不随输出总长度增长（只看尾部窗口）', () => {
+  const detector = createRepeatDetector()
+  // 先灌一大段正常文本（几十万字符），再看 push 的边际耗时是否稳定。
+  detector.push(variedProse(5000))
+  const piece = '后续的补充说明文字，用于测量边际成本。'
+  const startedAt = Date.now()
+  for (let i = 0; i < 50000; i += 1) detector.push(piece)
+  const elapsed = Date.now() - startedAt
+  assert.ok(elapsed < 3000, '5 万次 push 耗时 ' + elapsed + 'ms，超出预期')
+})
+
+/** 判断一个周期片段的不同字符数是否达到默认下限（供用例自检）。 */
+function distinctEnough(text) {
+  return new Set(text).size >= REPEAT_DEFAULTS.minPatternDistinct
+}
