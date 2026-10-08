@@ -7,7 +7,15 @@
  * 运行：node test/diagnose.mjs
  */
 
-import { LINE_DEFAULTS, REPEAT_DEFAULTS, createRepeatDetector, detectInTail } from '../lib/detect.js'
+import {
+  LINE_DEFAULTS,
+  REPEAT_DEFAULTS,
+  UNFINISHED_DEFAULTS,
+  createRepeatDetector,
+  detectInTail,
+  detectUnfinished,
+} from '../lib/detect.js'
+import { createTailBuffer } from '../lib/index.js'
 
 /** 复现群友事故里的真实推理循环文本（15 行，逐字取自截图）。 */
 const REAL_LOOP_BODY = [
@@ -157,3 +165,136 @@ bench('复读文本（会在中途熔断）', () => {
 console.log('')
 console.log('说明：检测器只保留尾部 ' + REPEAT_DEFAULTS.windowChars + ' 字符的窗口，')
 console.log('      所以单条流的额外内存是固定的，不随输出总长增长。')
+
+console.log('')
+console.log('='.repeat(78))
+console.log('四、未完成识别：哪些会被接上、哪些不会')
+console.log('='.repeat(78))
+console.log('上半是「说了一半就停」的典型形态（会被接上），下半是正常收尾（不许打扰）：')
+console.log('')
+
+/**
+ * 打印一条未完成判定样例。
+ * @param {string} label - 场景名。
+ * @param {string} finishKind - 流的结束方式。
+ * @param {string} text - 正文尾部。
+ */
+function unfinishedCase(label, finishKind, text) {
+  const hit = detectUnfinished(finishKind, text)
+  const verdict = hit === null ? '不管（视为正常收尾）' : '接上（' + hit.reason + '）'
+  console.log('  ' + label.padEnd(24) + verdict)
+}
+
+unfinishedCase('被长度上限截断', 'max-tokens', '写到一半的正文')
+unfinishedCase('代码块没闭合', 'stop', '改法如下：\n```js\nconst a = 1\n')
+unfinishedCase('停在逗号上', 'stop', '这个函数的作用是把输入转换成输出，')
+unfinishedCase('停在冒号上', 'stop', '结论如下：')
+unfinishedCase('「我先去确认一下」', 'stop', '先确认 README 第二节的真实设置项，避免我写的新表与它不符。')
+unfinishedCase('英文 Let me …', 'stop', 'Let me run the tests.')
+console.log('  ' + '-'.repeat(46))
+unfinishedCase('句号正常收尾', 'stop', '以上就是全部改动，测试都通过了。')
+unfinishedCase('完整代码块收尾', 'stop', '```js\nlet a = 1\n```\n')
+unfinishedCase('表格收尾', 'stop', '| 项目 | 结果 |\n| --- | --- |\n| A | 通过 |\n')
+unfinishedCase('对用户交代下一步', 'stop', '你可以先确认一下配置。')
+unfinishedCase('省略号收尾', 'stop', '大概就是这样吧…')
+unfinishedCase('被中断（aborted）', 'aborted', '这个函数的作用是把输入转换成输出，')
+
+console.log('')
+console.log('='.repeat(78))
+console.log('五、尾部缓冲的开销（每个 token 级分片都要过一遍）')
+console.log('='.repeat(78))
+
+bench('尾部缓冲（8 字符）× 5 万次', () => {
+  const buffer = createTailBuffer(UNFINISHED_DEFAULTS.tailChars)
+  for (let i = 0; i < small.length; i += 8) buffer.push(small.slice(i, i + 8))
+}, small.length)
+
+bench('对照：旧写法 (tail+text).slice(-N)', () => {
+  let tail = ''
+  for (let i = 0; i < small.length; i += 8) {
+    tail = (tail + small.slice(i, i + 8)).slice(-UNFINISHED_DEFAULTS.tailChars)
+  }
+}, small.length)
+
+console.log('')
+console.log('说明：尾部缓冲最多占用约 2 个窗口（' + UNFINISHED_DEFAULTS.tailChars + ' 字符 × 2）的内存，')
+console.log('      只有「攒够一个窗口」或「真要读尾巴」时才做一次合并 —— 这就是它比')
+console.log('      每片都拼接截断快得多的原因。')
+
+console.log('')
+console.log('='.repeat(78))
+console.log('七、完整链路：把插件挂在一整条流上要多久')
+console.log('='.repeat(78))
+
+const { drain, mount, streamOf } = await import('./harness.mjs')
+
+/**
+ * 把一段文本切成流分片（末尾补一个正常结束的 finish）。
+ * @param {string} text - 文本。
+ * @param {number} size - 每片字符数。
+ * @returns {object[]} 分片数组。
+ */
+function makeChunks(text, size) {
+  const out = []
+  for (let i = 0; i < text.length; i += size) {
+    out.push({ type: 'text-delta', index: 0, text: text.slice(i, i + size) })
+  }
+  out.push({ type: 'finish', reason: { kind: 'stop' } })
+  return out
+}
+
+const benchChunks = makeChunks(small, 8) // 最碎的 token 级分片形态
+const benchApp = mount({})
+const benchAppNoTail = mount({ unfinished: { enabled: false } })
+
+/** 跑一遍完整的 llm/stream 包装链路（复读检测 + 尾部缓冲 + 记账）。 */
+async function throughPlugin(app) {
+  await drain(app.stream({ sessionId: 'bench', provider: 'p', model: 'm' }, () => streamOf(benchChunks).source))
+}
+
+/** 跑一遍不经过插件的裸流，作为对照。 */
+async function bare() {
+  await drain(streamOf(benchChunks).source)
+}
+
+/** 计时跑一次异步操作。 @param {() => Promise<void>} run - 被测操作。 @returns {Promise<number>} 毫秒。 */
+async function timeIt(run) {
+  const startedAt = process.hrtime.bigint()
+  await run()
+  return Number(process.hrtime.bigint() - startedAt) / 1e6
+}
+
+/**
+ * 跑若干次、取最快的一次。
+ *
+ * 为什么要取最小值：这类测量会被 GC 和系统调度打断，平均值只反映「附近有多吵」。
+ * 最小值才最接近这段代码的真实成本。
+ *
+ * @param {number} times - 跑几次。
+ * @param {() => Promise<void>} run - 被测操作。
+ * @returns {Promise<number>} 最快一次的毫秒数。
+ */
+async function bestOf(times, run) {
+  let best = Number.POSITIVE_INFINITY
+  for (let i = 0; i < times; i += 1) best = Math.min(best, await timeIt(run))
+  return best
+}
+
+// 预热，避免把 JIT 编译时间算进去。
+await throughPlugin(benchApp)
+await throughPlugin(benchAppNoTail)
+await bare()
+
+const bareMs = await bestOf(3, bare)
+const noTailMs = await bestOf(3, () => throughPlugin(benchAppNoTail))
+const withTailMs = await bestOf(3, () => throughPlugin(benchApp))
+
+console.log('  样本 ' + small.length + ' 字符 / ' + benchChunks.length + ' 个分片（8 字符一片）')
+console.log('  裸流（不经过插件）          ' + bareMs.toFixed(1).padStart(8) + ' ms')
+console.log('  经过插件（不含尾部缓冲）      ' + noTailMs.toFixed(1).padStart(8) + ' ms')
+console.log('  经过插件（含尾部缓冲）       ' + withTailMs.toFixed(1).padStart(8) + ' ms')
+console.log('  ── 本次新增功能的净开销     ' + (withTailMs - noTailMs).toFixed(1).padStart(8) + ' ms')
+console.log('')
+console.log('说明：三个数字里绝大部分是「构造与消费几万个对象」的固有成本 —— 真正属于')
+console.log('      检测的部分请看第三节与第五节。新增功能摊到每个分片上只有亚微秒级，')
+console.log('      相对于一次真实模型调用的耗时（秒级）完全可以忽略。')

@@ -16,8 +16,10 @@ import assert from 'node:assert/strict'
 import {
   LINE_DEFAULTS,
   REPEAT_DEFAULTS,
+  UNFINISHED_DEFAULTS,
   createRepeatDetector,
   detectInTail,
+  detectUnfinished,
   findRepeatingLineBlock,
   findRepeatingPeriod,
   significantLines,
@@ -351,7 +353,116 @@ test('工具函数：significantLines 会丢掉空行与过短行', () => {
 })
 
 // ---------------------------------------------------------------------------
-// 4. 性能
+// 4. 未完成识别（「说了一半就停」）
+//
+//    这一组里**「不命中」比「命中」更重要**：误报会让正常回答被追着让模型继续说，
+//    比原来的毛病更烦人。所以每条命中用例都配了对应的「正常情况必须放过」。
+// ---------------------------------------------------------------------------
+
+test('未完成：被长度上限截断 → 必报（不需要看正文）', () => {
+  const hit = detectUnfinished('max-tokens', '')
+  assert.equal(hit.reason, 'max-tokens')
+  assert.equal(typeof hit.detail, 'string')
+})
+
+test('未完成：代码围栏没闭合 → 报', () => {
+  const hit = detectUnfinished('stop', '下面给出改法：\n```js\nconst a = 1\n')
+  assert.equal(hit.reason, 'open-code-fence')
+})
+
+test('未完成：代码围栏成对闭合 → 不报（这是最常见的正常收尾之一）', () => {
+  assert.equal(detectUnfinished('stop', '下面给出改法：\n```js\nconst a = 1\n```\n'), null)
+  // 两个代码块（4 个围栏）同样不报。
+  assert.equal(detectUnfinished('stop', '```\na\n```\n```\nb\n```\n'), null)
+})
+
+test('未完成：停在逗号 / 冒号上 → 报', () => {
+  assert.equal(detectUnfinished('stop', '这个函数的作用是把输入转换成输出，').reason, 'dangling-punctuation')
+  assert.equal(detectUnfinished('stop', '结论如下：').reason, 'dangling-punctuation')
+  assert.equal(detectUnfinished('stop', 'and then we need to,').reason, 'dangling-punctuation')
+})
+
+test('未完成：省略号与句号结尾都算正常收尾 → 不报', () => {
+  assert.equal(detectUnfinished('stop', '大概就是这样吧…'), null, '省略号是正常语气收尾')
+  assert.equal(detectUnfinished('stop', '以上就是全部改动，测试都通过了。'), null)
+})
+
+test('未完成：最后一句是自我承诺 → 报（真实事故原话）', () => {
+  const screenshot = '先确认 README 第二节的真实设置项，避免我写的新表与它不符。'
+  const hit = detectUnfinished('stop', screenshot)
+  assert.equal(hit.reason, 'pending-promise')
+  assert.ok(hit.detail.includes('先确认'), '说明里要带上那句原话，便于排查')
+})
+
+test('未完成：中英文承诺句式都要认', () => {
+  for (const text of ['下一步我准备重构这一块。', 'Let me run the tests.', "I'll check the config first.", '让我先读一下这个文件。']) {
+    const hit = detectUnfinished('stop', text)
+    assert.equal(hit?.reason, 'pending-promise', '应当命中：' + text)
+  }
+})
+
+test('未完成：对用户说「你可以先确认一下」→ 不报（那是在正常交代，不是没写完）', () => {
+  assert.equal(detectUnfinished('stop', '你可以先确认一下配置。'), null)
+  assert.equal(detectUnfinished('stop', '接下来你需要在设置里打开这一项。'), null)
+})
+
+test('未完成：以问句收尾 → 不报', () => {
+  assert.equal(detectUnfinished('stop', '你觉得这样改行吗？'), null)
+})
+
+test('未完成：以表格 / 列表 / 短行收尾 → 不报（刻意不做「没句号就算没说完」）', () => {
+  assert.equal(detectUnfinished('stop', '| 项目 | 结果 |\n| --- | --- |\n| A | 通过 |\n'), null)
+  assert.equal(detectUnfinished('stop', '- 第一项\n- 第二项\n'), null)
+  assert.equal(detectUnfinished('stop', 'done\n'), null)
+})
+
+test('未完成：只有 stop 才走启发式，aborted / error / 缺失一律不插手', () => {
+  const half = '这个函数的作用是把输入转换成输出，'
+  assert.equal(detectUnfinished('aborted', half), null)
+  assert.equal(detectUnfinished('error', half), null)
+  assert.equal(detectUnfinished(undefined, half), null, '没收到结束标记时无从判断，宁可漏')
+})
+
+test('未完成：空文本或纯空白 → 不报', () => {
+  assert.equal(detectUnfinished('stop', ''), null)
+  assert.equal(detectUnfinished('stop', undefined), null)
+  assert.equal(detectUnfinished('stop', '   \n\n\t '), null)
+})
+
+test('未完成：promises 关掉后，只有「自我承诺」这一条失效，其余照常', () => {
+  const opts = { detectPromises: false }
+  assert.equal(detectUnfinished('stop', '先确认一下配置。', opts), null)
+  assert.equal(detectUnfinished('stop', '下面给出改法：\n```js\nlet a = 1\n', opts).reason, 'open-code-fence')
+  assert.equal(detectUnfinished('stop', '话说到一半，', opts).reason, 'dangling-punctuation')
+  assert.equal(detectUnfinished('max-tokens', '', opts).reason, 'max-tokens')
+})
+
+test('未完成：只看尾部窗口，前面写得再长也不影响判定', () => {
+  const long = variedProse(4000) // 远大于默认窗口
+  assert.ok(long.length > UNFINISHED_DEFAULTS.tailChars, '样本必须超过窗口，否则测不到裁剪')
+  // 正常收尾的长回答：哪怕正文有几十万字，也不该被判为没写完。
+  assert.equal(detectUnfinished('stop', long + '以上，改动完成。'), null)
+  // 半截收尾：窗口裁过之后，尾巴上的逗号仍然要能认出来。
+  assert.equal(detectUnfinished('stop', long + '接下来还需要，').reason, 'dangling-punctuation')
+})
+
+test('未完成：超长的「承诺句」不参与判定（避免偶然用词误报）', () => {
+  const promise = '让我去看一下配置文件'
+  assert.equal(detectUnfinished('stop', '开头一句。' + promise).reason, 'pending-promise', '短句里的承诺应当命中')
+
+  // 同样的句式，但这一句拖到 200 字符以上 —— 那更像整段论述里的偶然用词，不判。
+  const longOne = '开头一句。' + promise + '，' + '细节'.repeat(120)
+  assert.ok(longOne.length > 200, '样本必须超过承诺句长度上限')
+  assert.equal(detectUnfinished('stop', longOne), null)
+})
+
+test('参数自洽：未完成识别的默认参数合理', () => {
+  assert.ok(UNFINISHED_DEFAULTS.tailChars >= 1024, '窗口太小会看不到尾巴')
+  assert.equal(UNFINISHED_DEFAULTS.detectPromises, true)
+})
+
+// ---------------------------------------------------------------------------
+// 5. 性能
 // ---------------------------------------------------------------------------
 
 test('性能：10 万次小分片 push 必须很快（每个 token 级分片都会调它）', () => {

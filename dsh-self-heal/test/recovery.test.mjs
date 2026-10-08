@@ -8,10 +8,10 @@
  *     → 返回 `{ kind: 'retry' }` 让 agent 循环用压缩后的历史重发
  *     → 同一轮对话有次数上限，绝不无限重试
  *
- *   一轮即将结束、模型什么都没说
- *     → `agent/turn-stopping` 里注入一条提醒
- *     → 本轮继续跑一步，把正文真正写出来
- *     → 同样有次数上限与时效限制
+ *   一轮即将结束、模型的话没说完（一个字没说，或者说了半截）
+ *     → `agent/turn-stopping` 里**先压缩上下文腾地方**
+ *     → 再注入一条提醒，让本轮继续跑一步把话说完
+ *     → 压缩不成也照样继续；同样有次数上限与时效限制
  *
  * 运行：node --test test/
  */
@@ -334,7 +334,8 @@ test('空谈：只思考不输出正文 → 注入提醒并要求重新输出', 
   assert.equal(message.source.form, 'notice')
   assert.ok(typeof message.source.summary === 'string' && message.source.summary.length > 0)
   assert.ok(typeof message.id === 'string' && message.id.length > 0, '必须带稳定身份 id')
-  assert.ok(message.content[0].text.includes('正文'), '提醒正文要明确要求输出正文')
+  assert.ok(message.content[0].text.includes('继续完成'), '提醒正文要明确要求接着往下写完')
+  assert.ok(message.content[0].text.includes('不要重复'), '要交代它别把已经写过的内容再写一遍')
   assert.ok(Object.isFrozen(message), '写进会话的消息必须已冻结')
 })
 
@@ -385,7 +386,7 @@ test('空谈：全是空白字符的正文视为没说', async () => {
 
 test('空谈：同一轮最多提醒 maxAttempts 次', async () => {
   const agent = fakeAgent()
-  const app = mount({ silentThought: { maxAttempts: 2 } })
+  const app = mount({ unfinished: { maxAttempts: 2 } })
 
   for (let i = 0; i < 3; i += 1) {
     await recordSilentThought(app, agent)
@@ -396,7 +397,7 @@ test('空谈：同一轮最多提醒 maxAttempts 次', async () => {
 
 test('空谈：换一轮后提醒次数重置', async () => {
   const agent = fakeAgent()
-  const app = mount({ silentThought: { maxAttempts: 1 } })
+  const app = mount({ unfinished: { maxAttempts: 1 } })
 
   await recordSilentThought(app, agent)
   await app.emit('agent/turn-stopping', { agent, turn: 1, signal: liveSignal() })
@@ -425,7 +426,7 @@ test('空谈：提醒之后模型补出了正文 → 不再打扰', async () => 
 
 test('空谈：记录过期后不再据此干预', async () => {
   const agent = fakeAgent()
-  const app = mount({ silentThought: { maxAgeMs: 0 } })
+  const app = mount({ unfinished: { maxAgeMs: 0 } })
   await recordSilentThought(app, agent)
   // maxAgeMs=0 表示「只认同一毫秒内」；等到下一毫秒必然过期。
   await new Promise((resolve) => setTimeout(resolve, 5))
@@ -466,9 +467,9 @@ test('空谈：被熔断的调用不参与记账（它走的是错误恢复那�
   assert.equal(agent.steered.length, 0)
 })
 
-test('空谈：silentThought.enabled=false 时完全不介入', async () => {
+test('空谈：unfinished.enabled=false 时完全不介入', async () => {
   const agent = fakeAgent()
-  const app = mount({ silentThought: { enabled: false } })
+  const app = mount({ unfinished: { enabled: false } })
   await recordSilentThought(app, agent)
   await app.emit('agent/turn-stopping', { agent, turn: 1, signal: liveSignal() })
   assert.equal(agent.steered.length, 0)
@@ -483,7 +484,7 @@ test('空谈：steer 本身抛错也不能崩（本轮照常结束）', async ()
   await recordSilentThought(app, agent)
   await app.emit('agent/turn-stopping', { agent, turn: 1, signal: liveSignal() })
   assert.ok(
-    app.logs.some((entry) => entry.message.includes('空谈补救失败')),
+    app.logs.some((entry) => entry.message.includes('未完成补救失败')),
     '必须把失败记下来而不是抛出',
   )
 })
@@ -494,6 +495,214 @@ test('极端：turn-stopping 载荷残缺也不得抛错', async () => {
   await app.emit('agent/turn-stopping', undefined)
   // 没崩就算过。
   assert.ok(true)
+})
+
+// ---------------------------------------------------------------------------
+// B2. 「说了半截」的判定，以及「先压缩、再继续」的顺序
+//
+//     顺序是本功能的要害：说一半就停，多半是上下文太满、没地方把话写完，
+//     所以要先压缩腾地方、再提醒它继续。顺序反了（先提醒后压缩）等于白压。
+// ---------------------------------------------------------------------------
+
+/** 让某次调用在记账表里留下「正文说了半截」的记录。 */
+async function recordHalfDone(mounted, agent, text, finishKind = 'stop') {
+  const chunks = [...textDeltas(text, 12), { type: 'finish', reason: { kind: finishKind } }]
+  const stream = mounted.stream({ sessionId: agent.session.id }, () => streamOf(chunks).source)
+  await drain(stream)
+}
+
+/**
+ * 造一个会记下「压缩」与「提醒」先后顺序的测试环境。
+ *
+ * @param {object} [config] - 插件配置。
+ * @param {'ok'|'noop'|'error'|'none'} [mode] - 压缩服务的行为：
+ *   ok=压缩且历史真的变短；noop=压缩过但历史没变；error=压缩抛错；none=没有压缩服务。
+ * @returns {object} `{ agent, app, order, compaction }`。
+ */
+function orderedEnv(config = {}, mode = 'ok') {
+  const order = []
+  const agent = fakeAgent()
+  const originalSteer = agent.steer.bind(agent)
+  agent.steer = (message) => {
+    order.push('steer')
+    originalSteer(message)
+  }
+
+  const services = {}
+  let compaction
+  if (mode !== 'none') {
+    const raw = fakeCompaction({
+      error: mode === 'error' ? new Error('摘要模型超时') : undefined,
+      effect: (target) => {
+        if (mode === 'ok') target.touch(1)
+      },
+    })
+    // 包一层：无论压缩成功还是抛错，都要把「调用过压缩」这件事记进顺序里 ——
+    // 直接挂在 effect 上的话，抛错那条路径根本走不到 effect。
+    compaction = {
+      calls: raw.calls,
+      compactIfNeeded(agent, trigger, signal) {
+        order.push('compact')
+        return raw.compactIfNeeded(agent, trigger, signal)
+      },
+    }
+    services.compaction = compaction
+  }
+  return { agent, app: mount(config, services), order, compaction }
+}
+
+test('未完成：命中后先压缩、再提醒（顺序不能颠倒）', async () => {
+  const { agent, app, order, compaction } = orderedEnv()
+  await recordHalfDone(app, agent, '先确认 README 第二节的真实设置项，避免我写的新表与它不符。')
+  await app.emit('agent/turn-stopping', { agent, turn: 1, signal: liveSignal() })
+
+  assert.deepEqual(order, ['compact', 'steer'], '必须先压缩腾地方，再提醒它继续')
+  assert.equal(compaction.calls.length, 1, '压缩只做一次')
+  assert.equal(compaction.calls[0].trigger, 'context-overflow', '要用强制压缩这一档')
+  assert.equal(agent.steered.length, 1)
+})
+
+test('未完成：max-tokens 截断 → 提醒接着写完', async () => {
+  const { agent, app } = orderedEnv({}, 'none')
+  await recordHalfDone(app, agent, '这是一段被长度上限截断的正文', 'max-tokens')
+  await app.emit('agent/turn-stopping', { agent, turn: 1, signal: liveSignal() })
+  assert.equal(agent.steered.length, 1)
+  assert.ok(app.logs.some((entry) => entry.message.includes('被长度上限截断')))
+})
+
+test('未完成：压缩服务不在时照样提醒（压缩是腾地方，不是前提）', async () => {
+  const { agent, app, order } = orderedEnv({}, 'none')
+  await recordHalfDone(app, agent, '这个函数的作用是把输入转换成输出，')
+  await app.emit('agent/turn-stopping', { agent, turn: 1, signal: liveSignal() })
+
+  assert.deepEqual(order, ['steer'])
+  assert.equal(agent.steered.length, 1)
+  assert.ok(app.logs.some((entry) => entry.message.includes('找不到压缩服务')))
+})
+
+test('未完成：压缩抛错也要继续提醒', async () => {
+  const { agent, app, order } = orderedEnv({}, 'error')
+  await recordHalfDone(app, agent, '这个函数的作用是把输入转换成输出，')
+  await app.emit('agent/turn-stopping', { agent, turn: 1, signal: liveSignal() })
+
+  assert.deepEqual(order, ['compact', 'steer'])
+  assert.ok(app.logs.some((entry) => entry.message.includes('压缩失败')))
+})
+
+test('未完成：压缩没找到可压的区间，仍然提醒', async () => {
+  const { agent, app, order } = orderedEnv({}, 'noop')
+  await recordHalfDone(app, agent, '这个函数的作用是把输入转换成输出，')
+  await app.emit('agent/turn-stopping', { agent, turn: 1, signal: liveSignal() })
+
+  assert.deepEqual(order, ['compact', 'steer'])
+  assert.ok(app.logs.some((entry) => entry.message.includes('没有可压缩的区间')))
+})
+
+test('未完成：compact=false 时跳过压缩，直接提醒', async () => {
+  const { agent, app, order, compaction } = orderedEnv({ unfinished: { compact: false } })
+  await recordHalfDone(app, agent, '这个函数的作用是把输入转换成输出，')
+  await app.emit('agent/turn-stopping', { agent, turn: 1, signal: liveSignal() })
+
+  assert.deepEqual(order, ['steer'])
+  assert.equal(compaction.calls.length, 0, '关掉之后一次都不该压')
+})
+
+test('未完成：同一轮第二次命中只提醒、不再压缩（避免越压越薄）', async () => {
+  const { agent, app, order, compaction } = orderedEnv({ unfinished: { maxAttempts: 2 } })
+  await recordHalfDone(app, agent, '第一段没说完，')
+  await app.emit('agent/turn-stopping', { agent, turn: 1, signal: liveSignal() })
+  await recordHalfDone(app, agent, '第二段也没说完，')
+  await app.emit('agent/turn-stopping', { agent, turn: 1, signal: liveSignal() })
+
+  assert.deepEqual(order, ['compact', 'steer', 'steer'], '第二次只提醒，不再压缩')
+  assert.equal(compaction.calls.length, 1)
+  assert.ok(app.logs.some((entry) => entry.message.includes('已经压缩过一次')))
+})
+
+test('未完成：压缩期间用户按了停止 → 不再往对话里塞提醒', async () => {
+  const controller = new AbortController()
+  const agent = fakeAgent()
+  const compaction = fakeCompaction({ effect: () => controller.abort() })
+  const app = mount({}, { compaction })
+
+  await recordHalfDone(app, agent, '这个函数的作用是把输入转换成输出，')
+  await app.emit('agent/turn-stopping', { agent, turn: 1, signal: controller.signal })
+  assert.equal(agent.steered.length, 0)
+})
+
+test('未完成：正在调工具时，即使被截断也不打断（那是正常的「先干活」）', async () => {
+  const agent = fakeAgent()
+  const app = mount({})
+  const chunks = [
+    { type: 'tool-call-delta', index: 0, id: 'call-1', name: 'read_file', argumentsDelta: '{"path":"a"}' },
+    { type: 'finish', reason: { kind: 'max-tokens' } },
+  ]
+  await drain(app.stream({ sessionId: agent.session.id }, () => streamOf(chunks).source))
+  await app.emit('agent/turn-stopping', { agent, turn: 1, signal: liveSignal() })
+  assert.equal(agent.steered.length, 0)
+})
+
+test('未完成：正常收尾的回复绝不打扰（本功能最需要盯的误报）', async () => {
+  const { agent, app } = orderedEnv({}, 'none')
+  const normal = [
+    '以上就是全部改动，测试都通过了。',
+    '| 项目 | 结果 |\n| --- | --- |\n| A | 通过 |\n',
+    '```js\nconst a = 1\n```\n',
+    '你可以先确认一下配置。',
+    '大概就是这样吧…',
+  ]
+  for (const text of normal) {
+    await recordHalfDone(app, agent, text)
+    await app.emit('agent/turn-stopping', { agent, turn: 1, signal: liveSignal() })
+  }
+  assert.equal(agent.steered.length, 0, '正常收尾不得被追着让模型继续说')
+})
+
+test('未完成：truncated=false 时不管「说了半截」，但「一个字没说」照管', async () => {
+  const agent = fakeAgent()
+  const app = mount({ unfinished: { truncated: false } })
+
+  await recordHalfDone(app, agent, '这个函数的作用是，')
+  await app.emit('agent/turn-stopping', { agent, turn: 1, signal: liveSignal() })
+  assert.equal(agent.steered.length, 0, '关掉之后不该管说了半截')
+
+  await recordSilentThought(app, agent)
+  await app.emit('agent/turn-stopping', { agent, turn: 1, signal: liveSignal() })
+  assert.equal(agent.steered.length, 1, '「一个字没说」是另一个开关，仍然要管')
+})
+
+test('未完成：promises=false 时，「我先去确认一下」不再触发；其他判定不受影响', async () => {
+  const agent = fakeAgent()
+  const app = mount({ unfinished: { promises: false } })
+
+  await recordHalfDone(app, agent, '先确认 README 第二节的真实设置项，避免我写的新表与它不符。')
+  await app.emit('agent/turn-stopping', { agent, turn: 1, signal: liveSignal() })
+  assert.equal(agent.steered.length, 0)
+
+  await recordHalfDone(app, agent, '下面给出改法：\n```js\nlet a = 1\n')
+  await app.emit('agent/turn-stopping', { agent, turn: 1, signal: liveSignal() })
+  assert.equal(agent.steered.length, 1, '未闭合代码块属于另一条判据，不受 promises 开关影响')
+})
+
+test('未完成：提醒次数用满后就放手（不会变成新的死循环）', async () => {
+  const { agent, app } = orderedEnv({ unfinished: { maxAttempts: 2 } }, 'none')
+  for (let i = 0; i < 4; i += 1) {
+    await recordHalfDone(app, agent, '第 ' + i + ' 段没说完，')
+    await app.emit('agent/turn-stopping', { agent, turn: 1, signal: liveSignal() })
+  }
+  assert.equal(agent.steered.length, 2, '超过上限必须收手')
+  assert.ok(app.logs.some((entry) => entry.message.includes('已达到提醒上限')))
+})
+
+test('未完成：提醒之后再说话就正常了 → 不再打扰', async () => {
+  const { agent, app } = orderedEnv({}, 'none')
+  await recordHalfDone(app, agent, '这个函数的作用是，')
+  await app.emit('agent/turn-stopping', { agent, turn: 1, signal: liveSignal() })
+  assert.equal(agent.steered.length, 1)
+
+  await recordVisibleText(app, agent)
+  await app.emit('agent/turn-stopping', { agent, turn: 1, signal: liveSignal() })
+  assert.equal(agent.steered.length, 1, '这次说完了就别再打扰')
 })
 
 // ---------------------------------------------------------------------------

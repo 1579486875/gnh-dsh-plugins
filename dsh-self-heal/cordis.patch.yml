@@ -27,11 +27,15 @@
 #           enabled: true
 #           maxAttempts: 3
 #           retryWithoutCompaction: true
-#         silentThought:
+#         unfinished:
 #           enabled: true
+#           compact: true          # 命中后先压缩上下文腾地方、再提醒它继续
+#           silent: true           # 管「光想不说」
+#           truncated: true        # 管「说了一半就停」
+#           promises: true         # 「我先去确认一下…」这类句式（可关）
 #           maxAttempts: 2
 #           maxAgeMs: 300000
-#           message: '[系统自动提醒] 你只输出了思考，请直接把正文写出来。'
+#           message: '[系统自动提醒] 你上一条消息停在中途，请接着上一条继续完成。'
 #         repeat:
 #           enabled: true
 #           minChars: 4000

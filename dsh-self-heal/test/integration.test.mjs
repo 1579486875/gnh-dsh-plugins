@@ -247,8 +247,34 @@ test('配置：null / undefined / 非对象一律落到默认值', () => {
 })
 
 test('配置：分组配置的类型错误不得污染默认值', () => {
-  const cfg = resolveConfig({ recover: 'nope', silentThought: { maxAttempts: 'x' } })
+  const cfg = resolveConfig({ recover: 'nope', unfinished: { maxAttempts: 'x' } })
   assert.equal(cfg.recover.maxAttempts, DEFAULT_CONFIG.recover.maxAttempts)
-  assert.equal(cfg.silentThought.maxAttempts, DEFAULT_CONFIG.silentThought.maxAttempts)
-  assert.equal(typeof cfg.silentThought.message, 'string')
+  assert.equal(cfg.unfinished.maxAttempts, DEFAULT_CONFIG.unfinished.maxAttempts)
+  assert.equal(typeof cfg.unfinished.message, 'string')
+})
+
+test('配置：旧名 silentThought 仍然生效（改名不能让老配置静默失效）', () => {
+  const cfg = resolveConfig({
+    silentThought: { enabled: false, maxAttempts: 5, maxAgeMs: 1000, message: '旧文案' },
+  })
+  assert.equal(cfg.unfinished.enabled, false)
+  assert.equal(cfg.unfinished.maxAttempts, 5)
+  assert.equal(cfg.unfinished.maxAgeMs, 1000)
+  assert.equal(cfg.unfinished.message, '旧文案')
+  // 新版才有的开关保持默认值（旧版没有这些概念，默认值就是当时的行为）。
+  assert.equal(cfg.unfinished.compact, DEFAULT_CONFIG.unfinished.compact)
+  assert.equal(cfg.unfinished.truncated, DEFAULT_CONFIG.unfinished.truncated)
+})
+
+test('配置：新旧名字同时出现时，以新名为准', () => {
+  const cfg = resolveConfig({ unfinished: { maxAttempts: 7 }, silentThought: { maxAttempts: 1 } })
+  assert.equal(cfg.unfinished.maxAttempts, 7)
+})
+
+test('配置：unfinished 组的开关与类型校验', () => {
+  const cfg = resolveConfig({ unfinished: { compact: false, promises: false, tailChars: 2048, silent: 'yes' } })
+  assert.equal(cfg.unfinished.compact, false)
+  assert.equal(cfg.unfinished.promises, false)
+  assert.equal(cfg.unfinished.tailChars, 2048)
+  assert.equal(cfg.unfinished.silent, DEFAULT_CONFIG.unfinished.silent, '类型不对的值必须退回默认，而不是变成真值')
 })

@@ -24,9 +24,12 @@
  *         重发时请求是按压缩后的历史重新拼出来的，所以这一次有希望正常收尾。
  *
  *   3. `agent/turn-stopping`（顺序事件，一轮对话即将结束前的最后时刻）
- *      —— **治好「只想不说」**。如果这一轮模型只输出了思考、没有输出任何
- *         给用户看的正文，就在这里补一句提醒，让这一轮继续跑一步、把正文
- *         真正写出来。
+ *      —— **治好「没说完就停」**。两种情况都管：
+ *         · 模型只输出了思考、没有输出任何给用户看的正文；
+ *         · 模型说了一半就停（被长度上限截断 / 代码块没闭合 / 停在逗号上 /
+ *           最后一句是「我先去确认一下 X」却没有下文）。
+ *         命中后**先压缩上下文腾出空间，再补一句提醒**让它接着写 —— 因为
+ *         说一半就停，多半就是上下文太满、没地方把话写完了。
  *
  * ─────────────────────────────────────────────────────────────────────────
  * 为什么不用抛异常
@@ -54,7 +57,13 @@
 
 import { randomUUID } from 'node:crypto'
 
-import { LINE_DEFAULTS, REPEAT_DEFAULTS, createRepeatDetector } from './detect.js'
+import {
+  LINE_DEFAULTS,
+  REPEAT_DEFAULTS,
+  UNFINISHED_DEFAULTS,
+  createRepeatDetector,
+  detectUnfinished,
+} from './detect.js'
 
 /** Cordis 插件名（组合行里的标识，与 npm 包名 `dsh-self-heal` 不同）。 */
 export const name = 'self-heal'
@@ -106,17 +115,50 @@ export const DEFAULT_CONFIG = Object.freeze({
      */
     retryWithoutCompaction: true,
   },
-  /** 「只想不说」的补救。 */
-  silentThought: {
+  /**
+   * 「没说完就停」的补救。
+   *
+   * 两种表现合在一组配置里，因为它们本质是同一件事：
+   *   · `silent`    —— 一个字没给用户看（只思考不说话）；
+   *   · `truncated` —— 说了半截（被截断、代码块没闭合、停在逗号上）。
+   * 提醒次数上限两者共享，用户只需要理解「同一轮最多提醒几次」。
+   */
+  unfinished: {
     enabled: true,
-    /** 同一轮对话里最多提醒几次。 */
+    /**
+     * 命中后**先压缩上下文、再让它继续**。
+     *
+     * 为什么默认开：说一半就停，多半是上下文已经太满、模型没地方把话写完；
+     * 不腾地方就催它继续，它往往再停一次。关掉就变成「直接催它继续」。
+     * 注意压缩只是**腾地方的手段**：压缩服务不在、压缩报错、压缩没找到可压
+     * 的区间时，都照常继续输出 —— 绝不能因为压不了就不救了。
+     */
+    compact: true,
+    /** 情形一：只思考、没有正文。 */
+    silent: true,
+    /** 情形二：说了半截（截断 / 未闭合代码块 / 悬空标点）。 */
+    truncated: true,
+    /**
+     * 情形二里最「软」的一条依据：最后一句是「我先去确认一下 X」这类承诺句式。
+     * 它误报率相对高，怕吵可以单独关掉，其余判定不受影响。
+     */
+    promises: UNFINISHED_DEFAULTS.detectPromises,
+    /** 同一轮对话里最多提醒几次（两种情形共享）。 */
     maxAttempts: 2,
     /** 记录的时效（毫秒）：超过这么久就不再据此干预，避免误伤下一轮。 */
     maxAgeMs: 300000,
-    /** 提醒正文；会在会话里以一条 user 消息的形式出现。 */
+    /** 判定用的尾部窗口（字符）；与检测内核的默认值保持同源，避免两处脱节。 */
+    tailChars: UNFINISHED_DEFAULTS.tailChars,
+    /**
+     * 提醒正文；会在会话里以一条 user 消息的形式出现。
+     *
+     * 文案刻意只说「怎么做」，不说「你被哪条规则判定为没写完」——后者是给
+     * 日志看的，写进对话只会浪费 token 并干扰模型的注意力。
+     */
     message:
-      '[系统自动提醒] 你上一轮只产生了思考内容，没有输出任何给用户看的正文。' +
-      '请立刻把结论写出来：不要再展开分析，不要重复思考过程，直接从结论或结果开始输出正文。',
+      '[系统自动提醒] 你上一条消息停在中途：话没说完，也没有发起工具调用。' +
+      '请接着上一条继续完成 —— 该调用工具的调用工具，该写完的继续写完；' +
+      '不要重复已经写过的内容，也不要重新开始。',
   },
 })
 
@@ -165,6 +207,31 @@ function mergeConfig(base, override) {
 }
 
 /**
+ * 把旧版配置名 `silentThought` 翻译成新版 `unfinished`。
+ *
+ * 背景：早期版本这一组叫 `silentThought`（只治「光想不说」），后来并入
+ * `unfinished`（把「说了一半就停」也一起管）。老用户 profile 里如果还写着
+ * 旧名字，这里照旧读进来，**不会因为改名而静默失效** —— 配置写错却不报错、
+ * 悄悄退回默认值，是这类插件最难查的一类毛病。
+ *
+ * 只搬运两边都有的四个键；新版新增的 `compact` / `silent` / `truncated` /
+ * `promises` 用新版默认值（旧版没有这些概念，而默认值就是当时的行为）。
+ *
+ * @param {object} raw - 原始配置。
+ * @returns {object|undefined} 翻译后的覆盖值；用户没写旧配置时返回 undefined。
+ */
+function legacyUnfinished(raw) {
+  const old = raw?.silentThought
+  if (!isObject(old)) return undefined
+  const out = {}
+  if (typeof old.enabled === 'boolean') out.enabled = old.enabled
+  if (typeof old.maxAttempts === 'number' && Number.isFinite(old.maxAttempts)) out.maxAttempts = old.maxAttempts
+  if (typeof old.maxAgeMs === 'number' && Number.isFinite(old.maxAgeMs)) out.maxAgeMs = old.maxAgeMs
+  if (typeof old.message === 'string' && old.message.trim() !== '') out.message = old.message
+  return out
+}
+
+/**
  * 归一化插件配置：把外层与各分组一起补齐成「一定是完整、类型正确」的对象。
  * @param {unknown} config - 组合行传进来的原始配置。
  * @returns {object} 生效配置。
@@ -174,7 +241,10 @@ export function resolveConfig(config) {
   return {
     ...mergeConfig(DEFAULT_CONFIG, raw),
     recover: mergeConfig(DEFAULT_CONFIG.recover, raw.recover),
-    silentThought: mergeConfig(DEFAULT_CONFIG.silentThought, raw.silentThought),
+    unfinished: mergeConfig(
+      DEFAULT_CONFIG.unfinished,
+      isObject(raw.unfinished) ? raw.unfinished : legacyUnfinished(raw),
+    ),
     repeat: mergeConfig(REPEAT_DEFAULTS, raw.repeat),
     lines: mergeConfig(LINE_DEFAULTS, raw.lines),
   }
@@ -313,6 +383,84 @@ function logLine(ctx, cfg, level, message) {
 }
 
 /**
+ * 造一个「只保留最近 N 个字符」的尾巴缓冲。
+ *
+ * 用途：一轮对话结束时，要看看正文的**尾巴**长什么样（是不是停在逗号上、
+ * 代码块有没有闭合）。正文可能有几十万字，但我们只关心最后几千字。
+ *
+ * ⚠️ 为什么不用最直观的写法 `tail = (tail + text).slice(-N)`：
+ * 那一句每次都要把整个窗口重新拼一遍、再复制一遍，而它会被**每个 token 级
+ * 分片**调用 —— 一次 40 万字符的回答就是几万次复制。上一轮正是删掉同类写法
+ * 之后，检测开销降到了原来的 1/29。
+ *
+ * 这里的做法是「先攒、后并」：
+ *   · 每个小分片只 push 进数组（O(1)，不碰已有内容）；
+ *   · 只有攒够一整个窗口的量（或者真的要读尾巴）时，才合并一次并截到窗口大小。
+ * 于是合并次数从「每个分片一次」降到「每 N 个字符一次」，内存也有硬上限
+ * （最多约 2 个窗口），长期运行不会慢慢涨。
+ *
+ * @param {number} limitChars - 窗口大小（字符）。传非法值时退回 4096。
+ * @returns {{push: (text: string) => void, text: () => string, chars: () => number}} 缓冲对象。
+ */
+export function createTailBuffer(limitChars) {
+  const limit =
+    typeof limitChars === 'number' && Number.isFinite(limitChars) && limitChars > 0 ? Math.floor(limitChars) : 4096
+
+  /** 还没合并的文本片段。 */
+  let pieces = []
+  /** 自上次合并以来新攒了多少个字符，用来决定什么时候值得合并一次。 */
+  let pending = 0
+
+  /**
+   * 把数组里的片段合并成一段，只保留尾巴，并重置计数。
+   * @returns {string} 合并后的尾部文本。
+   */
+  const compactNow = () => {
+    pending = 0
+    if (pieces.length === 0) return ''
+    // 只有一段、而且没超过窗口：无需任何复制，直接用。
+    if (pieces.length === 1 && pieces[0].length <= limit) return pieces[0]
+    let joined = pieces.length === 1 ? pieces[0] : pieces.join('')
+    if (joined.length > limit) joined = joined.slice(-limit)
+    pieces = [joined]
+    return joined
+  }
+
+  return {
+    /**
+     * 追加一段增量文本。
+     * @param {string} text - 增量文本；空串或非字符串会被忽略。
+     * @returns {void}
+     */
+    push(text) {
+      if (typeof text !== 'string' || text.length === 0) return
+      pieces.push(text)
+      pending += text.length
+      // 攒够一个窗口才合并一次：既保证内存不涨，又把复制成本摊薄。
+      if (pending >= limit) compactNow()
+    },
+
+    /**
+     * 读出当前的尾部文本（最多 limit 个字符）。
+     * @returns {string} 尾部文本。
+     */
+    text() {
+      return compactNow()
+    },
+
+    /**
+     * 当前缓冲里保存了多少个字符（只给诊断脚本用）。
+     * @returns {number} 字符数。
+     */
+    chars() {
+      let total = 0
+      for (const piece of pieces) total += piece.length
+      return total
+    },
+  }
+}
+
+/**
  * 包住一条上游模型流，实时检查「是不是跑飞了」。
  *
  * 两道检查：
@@ -342,6 +490,18 @@ async function* healStream(ctx, cfg, options, source, attempts) {
 
   /** 本次调用「说没说正文 / 干没干活」，供一轮结束时判断是否补救。 */
   const visibility = { hasText: false, hasToolCall: false }
+
+  /**
+   * 正文的尾部缓冲，供「是不是说了一半」的判定使用。
+   *
+   * 只收正文（`text-delta`），**不收思考内容**：用户看不到思考，思考写到一半
+   * 不算「没说完」。补救功能关掉时连缓冲都不建，一分钱开销都不花。
+   */
+  const collectTail = cfg.unfinished.enabled === true
+  const tailBuffer = collectTail ? createTailBuffer(cfg.unfinished.tailChars) : null
+
+  /** 这次流是怎么结束的（`stop` / `max-tokens` / `error` …），取自末尾的 finish 分片。 */
+  let finishKind
 
   let outChars = 0
   let trip = null
@@ -379,12 +539,19 @@ async function* healStream(ctx, cfg, options, source, attempts) {
       const text = detectableTextOf(chunk)
       if (text !== null) outChars += text.length
       noteVisibility(visibility, chunk)
+      // 只把正文喂给尾部缓冲；思考内容不参与「说没说完」的判定。
+      if (tailBuffer !== null && isObject(chunk) && chunk.type === 'text-delta' && typeof chunk.text === 'string') {
+        tailBuffer.push(chunk.text)
+      }
 
       // 原样放行，再判定。
       yield chunk
 
       if (isObject(chunk) && chunk.type === 'finish') {
         upstreamDrained = true
+        // 记下「这次是怎么结束的」：被长度上限截断时，补救要靠它认出来。
+        const reason = chunk.reason
+        finishKind = isObject(reason) && typeof reason.kind === 'string' ? reason.kind : undefined
         break
       }
 
@@ -420,6 +587,9 @@ async function* healStream(ctx, cfg, options, source, attempts) {
         hasText: visibility.hasText,
         hasToolCall: visibility.hasToolCall,
         chars: outChars,
+        // 下面两项供「说了一半就停」的判定使用（一轮结束时才读）。
+        finishKind,
+        tailText: tailBuffer === null ? '' : tailBuffer.text(),
       })
     }
   }
@@ -506,6 +676,39 @@ function isSelfHealTrip(failure) {
 }
 
 /**
+ * 记下「压缩之前」的历史版本号。
+ *
+ * 会话历史被压缩成摘要时 `replaceGeneration` 会前进；工具结果被剪枝时
+ * `contentGeneration` 会前进。压缩前后各取一次，就能知道它到底有没有干活 ——
+ * 这是判断「这次压缩值不值得继续」的唯一依据。
+ *
+ * @param {object} surface - 会话的 surface 对象（`agent.session.surface`）。
+ * @returns {{replace: number|undefined, content: number|undefined}} 版本号快照。
+ */
+function historyMark(surface) {
+  return {
+    replace: isObject(surface) ? surface.replaceGeneration : undefined,
+    content: isObject(surface) ? surface.contentGeneration : undefined,
+  }
+}
+
+/**
+ * 压缩有没有真的让历史发生变化（被替换成摘要，或工具结果被剪枝）。
+ *
+ * 两个版本号任何一个前进都算「有进展」：都意味着下一次请求会比原来小。
+ *
+ * @param {object} surface - 会话的 surface 对象。
+ * @param {{replace: number|undefined, content: number|undefined}} mark - 压缩前的快照。
+ * @returns {boolean} 历史是否发生了变化。
+ */
+function historyChanged(surface, mark) {
+  if (!isObject(surface) || !isObject(mark)) return false
+  const replaced = typeof mark.replace === 'number' && surface.replaceGeneration > mark.replace
+  const shrunk = typeof mark.content === 'number' && surface.contentGeneration > mark.content
+  return replaced || shrunk
+}
+
+/**
  * 安装「熔断之后救回来」的恢复逻辑，挂在 `agent/request-error` 上。
  *
  * 完整流程：
@@ -541,8 +744,7 @@ function installRunawayRecovery(ctx, cfg) {
         return next()
       }
 
-      const beforeReplace = surface.replaceGeneration
-      const beforeContent = surface.contentGeneration
+      const mark = historyMark(surface)
 
       const compaction = compactionFor(ctx, agent)
       if (compaction === undefined) {
@@ -563,10 +765,9 @@ function installRunawayRecovery(ctx, cfg) {
       }
 
       // 「有进展」的判据：历史被替换（压缩成摘要）**或**内容被改写（工具结果剪枝）。
-      // 两者都让下一次请求变小，都值得重发。
-      const replaced = typeof beforeReplace === 'number' && surface.replaceGeneration > beforeReplace
-      const shrunk = typeof beforeContent === 'number' && surface.contentGeneration > beforeContent
-      const progressed = replaced || shrunk
+      // 两者都让下一次请求变小，都值得重发。判据本身在 historyChanged 里，
+      // 与「没说完就继续」那条链路共用，避免两处各写一份、日后改歪一处。
+      const progressed = historyChanged(surface, mark)
 
       if (!progressed && cfg.recover.retryWithoutCompaction !== true) {
         logLine(ctx, cfg, 'warn', '压缩没有让历史变短，按配置不再重试。')
@@ -593,23 +794,97 @@ function installRunawayRecovery(ctx, cfg) {
 }
 
 /**
- * 安装「只想不说」的补救，挂在 `agent/turn-stopping` 上。
+ * 判断「这一次调用算不算没说完」。返回 null 表示正常收尾，不用管。
  *
- * 时机正好：这个事件在一轮对话即将结束、且模型已经不欠任何工具调用时触发。
- * 此时如果最近这次调用「没有正文、也没有工具调用」，说明模型光想不说，
- * 用户什么都看不到 —— 于是投一条提醒（steering）进去，让这一轮再跑一步。
+ * 顺序很重要，从「明确」排到「含糊」：
+ *   1. 有工具调用   → 它在干活，只是还没轮到输出正文，不管；
+ *   2. 一个字没说   → 光想不说（受 `silent` 开关控制）；
+ *   3. 说了半截     → 交给检测内核判定（受 `truncated` / `promises` 开关控制）。
+ *
+ * @param {object} info - 本次调用的记账（见 {@link healStream}）。
+ * @param {object} cfg - 生效配置。
+ * @returns {{kind: string, detail: string}|null} 命中描述；正常收尾返回 null。
+ */
+function unfinishedOf(info, cfg) {
+  // 正在调工具：这是正常的「先干活，稍后再汇报」，不能打断。
+  if (info.hasToolCall === true) return null
+
+  // 情形一：一个字都没给用户看。
+  if (info.hasText !== true) {
+    if (cfg.unfinished.silent !== true) return null
+    return { kind: 'no-content', detail: '只产生了思考内容，没有输出任何给用户看的正文' }
+  }
+
+  // 情形二：说了半截。判据放在纯函数里（便于单测），两个开关一并传进去。
+  if (cfg.unfinished.truncated !== true) return null
+  const hit = detectUnfinished(info.finishKind, info.tailText, {
+    tailChars: cfg.unfinished.tailChars,
+    detectPromises: cfg.unfinished.promises,
+  })
+  if (hit === null) return null
+  return { kind: hit.reason, detail: hit.detail }
+}
+
+/**
+ * 命中「没说完」之后，先想办法给上下文腾地方。
+ *
+ * 为什么先压缩再继续：说一半就停，多半是上下文已经太满、模型没地方把话写完；
+ * 不腾地方就催它继续，它往往再停一次。这与「熔断之后先压缩再重发」是同一个
+ * 套路，两处的判据也共用 {@link historyChanged}。
+ *
+ * ⚠️ 但压缩只是**腾地方的手段，不是继续输出的前提**：压缩服务不在、压缩报错、
+ * 压缩找不到可压的区间，这三种情况都照常往下走（各自返回一句说明供日志记录）。
  *
  * @param {object} ctx - Cordis 上下文。
  * @param {object} cfg - 生效配置。
- * @param {Map<string, object>} attempts - 「说没说正文」的记账表。
+ * @param {object} agent - 目标 agent。
+ * @param {AbortSignal|undefined} signal - 本轮的中断信号。
+ * @param {number} already - 本轮此前已经提醒过几次（第 2 次起不再压缩）。
+ * @returns {Promise<string>} 一句话说明这次压缩的结果，写进日志用。
+ */
+async function compactBeforeContinue(ctx, cfg, agent, signal, already) {
+  if (cfg.unfinished.compact !== true) return '未开启压缩（compact=false），直接继续'
+  // 同一轮里第二次命中就不再压了：连着压会把上下文越压越薄，得不偿失。
+  if (already > 0) return '本轮已经压缩过一次，直接继续'
+
+  const compaction = compactionFor(ctx, agent)
+  if (compaction === undefined) return '找不到压缩服务，直接继续'
+
+  const surface = agent?.session?.surface
+  const mark = historyMark(surface)
+  try {
+    await compaction.compactIfNeeded(agent, 'context-overflow', signal)
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    return '压缩失败（' + message + '），直接继续'
+  }
+  return historyChanged(surface, mark) ? '已压缩上下文（历史已变短）' : '压缩过，但这次没有可压缩的区间'
+}
+
+/**
+ * 安装「没说完就继续」的补救，挂在 `agent/turn-stopping` 上。
+ *
+ * 时机正好：这个事件在一轮对话即将结束、且模型已经不欠任何工具调用时触发。
+ * 此时如果最近这次调用「一个字没说」或者「说了一半就停」，用户就只能自己再
+ * 补一句「继续」—— 本函数替他补。完整动作是：
+ *
+ *   先压缩上下文腾地方 → 再投一条提醒（steering）→ 这一轮会再跑一步。
+ *
+ * ⚠️ 这个事件是**顺序派发**的，派发方会 `await` 处理器返回的 Promise，所以本
+ * 函数写成 async 并 await 压缩：压缩没做完，这一轮就不会急着结束 —— 正是我们
+ * 想要的效果，否则提醒会在压缩之前落到历史里，等于白压。
+ *
+ * @param {object} ctx - Cordis 上下文。
+ * @param {object} cfg - 生效配置。
+ * @param {Map<string, object>} attempts - 「这次调用输出了什么」的记账表。
  * @returns {void}
  */
-function installSilentThoughtRescue(ctx, cfg, attempts) {
+function installUnfinishedRescue(ctx, cfg, attempts) {
   /** agent → 本轮已提醒次数。 */
   const strikes = new WeakMap()
 
-  ctx.on('agent/turn-stopping', (payload) => {
-    if (cfg.silentThought.enabled !== true) return
+  ctx.on('agent/turn-stopping', async (payload) => {
+    if (cfg.unfinished.enabled !== true) return
     try {
       const agent = payload?.agent
       const turn = payload?.turn
@@ -617,36 +892,49 @@ function installSilentThoughtRescue(ctx, cfg, attempts) {
       if (!isObject(agent)) return
       const info = attemptOf(attempts, agent)
       if (info === undefined) return
-      // 说了正文，或者本来就该去调工具 —— 都是正常情况，不干预。
-      if (info.hasText === true || info.hasToolCall === true) return
       // 记录太老说明它已经不是「刚刚这次」的结果，宁可不干预也不误伤。
-      if (typeof info.at !== 'number' || Date.now() - info.at > cfg.silentThought.maxAgeMs) return
+      if (typeof info.at !== 'number' || Date.now() - info.at > cfg.unfinished.maxAgeMs) return
+
+      const hit = unfinishedOf(info, cfg)
+      if (hit === null) return
 
       const state = strikes.get(agent)
       const already = state !== undefined && state.turn === turn ? state.count : 0
-      if (already >= cfg.silentThought.maxAttempts) {
-        logLine(ctx, cfg, 'warn', '模型连续只思考不输出正文，已达到提醒上限，放行结束本轮。')
+      if (already >= cfg.unfinished.maxAttempts) {
+        logLine(
+          ctx,
+          cfg,
+          'warn',
+          '模型连续没把话说完（判定依据 ' + hit.kind + '），已达到提醒上限，放行结束本轮。',
+        )
         return
       }
-
       strikes.set(agent, { turn, count: already + 1 })
+
+      // ★ 先压缩、再继续（为什么这么排，见 compactBeforeContinue 的说明）。
+      const compactNote = await compactBeforeContinue(ctx, cfg, agent, payload?.signal, already)
+      // 压缩期间用户可能已经按了停止：那就什么都别做了。
+      if (payload?.signal?.aborted === true) return
+
       // 用掉这条记录：提醒之后会再跑一步，新的调用会重新记账。
       attempts.delete(agent.session.id)
-      agent.steer(createNoticeMessage(cfg.silentThought.message, '只思考未输出正文，要求补出正文'))
+      agent.steer(createNoticeMessage(cfg.unfinished.message, '输出未完成，要求接着写完'))
       logLine(
         ctx,
         cfg,
         'info',
-        '本轮模型只思考未输出正文（本次输出 ' +
-          String(typeof info.chars === 'number' ? info.chars : 0) +
-          ' 字符，全是思考），已注入提醒并要求重新输出（本轮第 ' +
+        '本轮输出未完成（' +
+          hit.detail +
+          '）：' +
+          compactNote +
+          '，已注入提醒要求接着写完（本轮第 ' +
           String(already + 1) +
           ' 次）。',
       )
     } catch (error) {
-      // 补救失败就算了：绝不能让「治好只想不说」这件事本身打断对话。
+      // 补救失败就算了：绝不能让「让它把话说完」这件事本身打断对话。
       const message = error instanceof Error ? error.message : String(error)
-      logLine(ctx, cfg, 'warn', '空谈补救失败（' + message + '），本轮照常结束。')
+      logLine(ctx, cfg, 'warn', '未完成补救失败（' + message + '），本轮照常结束。')
     }
   })
 }
@@ -681,7 +969,7 @@ export function apply(ctx, config) {
   )
 
   installRunawayRecovery(ctx, cfg)
-  installSilentThoughtRescue(ctx, cfg, attempts)
+  installUnfinishedRescue(ctx, cfg, attempts)
 
   logLine(
     ctx,
@@ -693,8 +981,8 @@ export function apply(ctx, config) {
       (cfg.repeat.enabled || cfg.lines.enabled ? '开' : '关') +
       '，熔断后压缩并重试 ' +
       (cfg.recover.enabled ? '开' : '关') +
-      '，只思考未输出正文的补救 ' +
-      (cfg.silentThought.enabled ? '开' : '关') +
+      '，没说完就继续的补救 ' +
+      (cfg.unfinished.enabled ? '开（' + (cfg.unfinished.compact ? '命中后先压缩、再继续' : '直接继续') + '）' : '关') +
       '）。',
   )
 }

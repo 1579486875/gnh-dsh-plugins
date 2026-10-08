@@ -231,7 +231,7 @@ await check('camelCase / 冻结的载荷不会破坏会话的深度校验', () =
 await check('默认配置里的提醒文案可以直接构造成合法消息', () => {
   const cfg = resolveConfig({})
   const session = Session.create('contract-check-session-3')
-  session.append('user/message', createNoticeMessage(cfg.silentThought.message, '默认文案'), { surfaceOp: 'append' })
+  session.append('user/message', createNoticeMessage(cfg.unfinished.message, '默认文案'), { surfaceOp: 'append' })
 })
 
 await check('带提醒消息的会话能被重新恢复（重启 DSH 后必须还能读档）', () => {
@@ -283,6 +283,19 @@ await check('插件能在真实 Cordis 上下文上完成安装（apply 不抛�
   apply(ctx, {})
 })
 
+await check('serial 派发会等待异步监听器（「先压缩、再继续」的立身之本）', async () => {
+  const ctx = new Context()
+  let finished = false
+  ctx.on('probe/serial-waits', async () => {
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    finished = true
+  })
+  await ctx.serial('probe/serial-waits', {})
+  if (!finished) {
+    throw new Error('Cordis 的 serial 不再等待异步监听器：压缩会在提醒之后才完成，顺序会失控')
+  }
+})
+
 await check('llm/stream → agent/request-error → agent/turn-stopping 三条链路真跑一遍', async () => {
   const ctx = new Context()
   apply(ctx, {})
@@ -316,13 +329,18 @@ await check('llm/stream → agent/request-error → agent/turn-stopping 三条�
   }
 
   // 2) 一轮即将结束：插件应当注入提醒。
+  //
+  //    派发方式必须用 `ctx.serial` —— 这正是 agent 循环真实的做法
+  //    （dsh-agent-loop 里是 `await dispatch.serial("agent/turn-stopping", …)`），
+  //    它会**等待异步监听器跑完**。本插件的补救逻辑是 async 的（要先压缩上下文
+  //    再提醒），用不等待的 `ctx.emit` 测，只会测出「还没轮到它跑」。
   const steered = []
   const agent = {
     session: { id: sessionId, surface: { replaceGeneration: 0, contentGeneration: 0 } },
     options: { provider: 'p', model: 'm' },
     steer: (message) => steered.push(message),
   }
-  ctx.emit('agent/turn-stopping', { agent, turn: 1, signal: new AbortController().signal })
+  await ctx.serial('agent/turn-stopping', { agent, turn: 1, signal: new AbortController().signal })
   if (steered.length !== 1) throw new Error('期望注入 1 条提醒，实际 ' + steered.length)
   if (steered[0].source.kind !== 'self-heal') throw new Error('提醒的 source.kind 不对')
 
