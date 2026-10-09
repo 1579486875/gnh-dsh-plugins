@@ -30,6 +30,21 @@ dsh plugin --profile <profile> add link:<插件目录>
 
 安装后**需要重启 DSH Host** 才会加载插件代码。
 
+### 装完怎么确认
+
+重启之后，按插件各自的方式确认一眼：
+
+| 插件 | 怎么确认它在工作 |
+| --- | --- |
+| [dsh-self-heal](dsh-self-heal) | 启动日志里出现 `self-heal: 自愈已就位（…）`。**零配置**，装完它自己盯着失控、自己救，不用你管 |
+| [dsh-rimcrow-tools](dsh-rimcrow-tools) | 模型工具里多出 `mcp__rimcrow__*` 那 7 个（当前启用列表 / 模组规则 / 元数据 / 搜索 / 分组 / 用户数据 / 日志上下文） |
+| [dsh-mod-classifier](dsh-mod-classifier) | 模型工具里多出 `mod_classify_scan` / `_check` / `_explain` / `_rules` |
+| [dsh-cherry-kb-bridge](dsh-cherry-kb-bridge) | 模型工具里多出 `cherry_kb_list` / `cherry_kb_query` / `cherry_kb_read` |
+| [dsh-electron-env-fix](dsh-electron-env-fix) | 没有日志，装上即生效：桌面版「用外部应用打开」能正常拉起 VS Code / Cursor 等 Electron 程序 |
+
+**每个插件的完整用法** —— 配置项怎么调、日志怎么看、怎么自测、有哪些已知边界 ——
+都在它自己的 README 里（点上面表格里的插件名）。三个需要环境变量的插件见下一节。
+
 ## 环境变量
 
 | 插件 | 变量 | 说明 |
