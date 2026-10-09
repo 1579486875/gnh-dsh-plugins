@@ -7,7 +7,7 @@
 
 | 插件 | 版本 | 作用 |
 | --- | --- | --- |
-| [dsh-self-heal](dsh-self-heal) | 0.2.0 | **失控自愈**：复读/墙钟超时熔断后自动压缩对话并重试续跑；模型「只思考不输出正文」时自动注入提醒要求补出正文（原名 dsh-loop-guard，已去掉单次输出上限） |
+| [dsh-self-heal](dsh-self-heal) | 0.6.0 | **失控自愈**：检测复读 / 短句打转 / 墙钟超时并熔断，然后压缩上下文 + 把失败原因告诉模型再重试，救不回来时给用户一句人话；「没说完就停」时先压缩再提醒它接着写；工具调用成环时注入提醒；并统计自愈成功率。**正常输出不会被打断**（2494 万字符真实语料零误报） |
 | [dsh-rimcrow-tools](dsh-rimcrow-tools) | 1.1.0 | 把 RimCrow 的 7 个模组工具注册为 DSH 模型工具（全程只读） |
 | [dsh-mod-classifier](dsh-mod-classifier) | 1.0.0 | RimWorld 模组分类器：全库扫描归类、按内容校验、单模组诊断、规则维护 |
 | [dsh-cherry-kb-bridge](dsh-cherry-kb-bridge) | 0.1.0 | 把 Cherry Studio 本地知识库桥接为 DSH 模型工具（只读，FTS5 全文检索） |
