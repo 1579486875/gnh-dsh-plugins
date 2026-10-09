@@ -428,7 +428,7 @@ test('恢复：写诊断失败也不能挡住重发', async () => {
   const app = mount({}, { compaction: fakeCompaction({ effect: (t) => t.touch(1) }) })
   const action = await app.waterfall('agent/request-error', tripPayload(agent), () => 'terminal')
   assert.deepEqual(action, { kind: 'retry' }, '诊断是锦上添花，不能拖垮恢复')
-  assert.ok(app.logs.some((entry) => entry.message.includes('写诊断消息失败')))
+  assert.ok(app.logs.some((entry) => entry.message.includes('写说明消息失败')))
 })
 
 test('恢复：会话没有 append 能力时静默跳过诊断', async () => {
@@ -437,6 +437,132 @@ test('恢复：会话没有 append 能力时静默跳过诊断', async () => {
   const app = mount({}, { compaction: fakeCompaction({ effect: (t) => t.touch(1) }) })
   const action = await app.waterfall('agent/request-error', tripPayload(agent), () => 'terminal')
   assert.deepEqual(action, { kind: 'retry' })
+})
+
+// ---------------------------------------------------------------------------
+// A3. 收尾：救不回来时给用户一句人话 + 自愈成功率
+//
+//     前者是「体验」：放弃之后这一轮会以 error 结束，用户不该只看到一行技术错误。
+//     后者是「诚实」：没有它，我们只能看见熔断了几次，永远不知道救回来几次。
+// ---------------------------------------------------------------------------
+
+test('放弃：熔断救到底时会给用户留一句人话', async () => {
+  const agent = fakeAgent()
+  const app = mount(
+    { recover: { maxAttempts: 1 } },
+    { compaction: fakeCompaction({ effect: (t) => t.touch(1) }) },
+  )
+
+  // 第一次：还能救 —— 写的是「给模型的诊断」。
+  await app.waterfall('agent/request-error', tripPayload(agent), () => 'terminal')
+  assert.equal(agent.appended.length, 1, '第一次恢复应当写一条给模型的诊断')
+
+  // 第二次：到顶，放弃 —— 这时应当多一条「给用户」的说明。
+  await app.waterfall('agent/request-error', tripPayload(agent), () => 'terminal')
+  assert.equal(agent.appended.length, 2, '放弃时要给用户一个交代')
+
+  const text = agent.appended[agent.appended.length - 1].message.content[0].text
+  assert.ok(text.startsWith('（失控自愈）'), '要让用户看出这条不是真人说的：' + text)
+  assert.ok(text.includes('连续 1 次'), '要说清救了几次')
+  assert.ok(text.includes('复读'), '病类要用用户看得懂的说法')
+  assert.ok(text.includes('拆小'), '要给出下一步建议')
+})
+
+test('放弃：关掉 reportGiveUp 之后不再打扰用户', async () => {
+  const agent = fakeAgent()
+  const app = mount(
+    { recover: { maxAttempts: 1, reportGiveUp: false } },
+    { compaction: fakeCompaction({ effect: (t) => t.touch(1) }) },
+  )
+  await app.waterfall('agent/request-error', tripPayload(agent), () => 'terminal')
+  const before = agent.appended.length
+  await app.waterfall('agent/request-error', tripPayload(agent), () => 'terminal')
+  assert.equal(agent.appended.length, before, '关掉之后不该再写说明')
+})
+
+test('放弃：三种熔断给三种说法', async () => {
+  for (const [code, needle] of [
+    [CODES.repeat, '复读'],
+    [CODES.loop, '短句打转'],
+    [CODES.timeout, '超时'],
+  ]) {
+    const agent = fakeAgent()
+    const app = mount(
+      { recover: { maxAttempts: 0 } },
+      { compaction: fakeCompaction({ effect: (t) => t.touch(1) }) },
+    )
+    await app.waterfall(
+      'agent/request-error',
+      tripPayload(agent, { failure: { message: 'x', code } }),
+      () => 'terminal',
+    )
+    const text = agent.appended[0]?.message?.content?.[0]?.text ?? ''
+    assert.ok(text.includes(needle), code + ' 的说法不对：' + text)
+  }
+})
+
+test('放弃：「没说完」催不动时也会给用户一个交代', async () => {
+  const agent = fakeAgent()
+  const app = mount({ unfinished: { maxAttempts: 1 } })
+
+  for (let i = 0; i < 2; i += 1) {
+    await recordHalfDone(app, agent, '这个函数的作用是把输入转换成输出，')
+    await app.emit('agent/turn-stopping', { agent, turn: 1, signal: liveSignal() })
+  }
+
+  const notice = agent.appended.find((item) => item.message.source.summary.includes('未完成'))
+  assert.ok(notice !== undefined, '催不动时应当写一条说明')
+  assert.ok(notice.message.content[0].text.includes('继续'), '要告诉用户可以回一句「继续」')
+})
+
+test('自愈统计：重发之后正常走完 → 记一次救回', async () => {
+  const agent = fakeAgent()
+  const app = mount({}, { compaction: fakeCompaction({ effect: (t) => t.touch(1) }) })
+
+  // 一次真的熔断（让 trips 有数）
+  await drain(
+    app.stream({ sessionId: agent.session.id }, () => streamOf(textDeltas(longLineLoop(150), 32)).source),
+  )
+  // 恢复：返回 retry，并记下「等着看这次行不行」
+  const action = await app.waterfall('agent/request-error', tripPayload(agent), () => 'terminal')
+  assert.deepEqual(action, { kind: 'retry' })
+  // 重发之后正常走完 —— 这一次自愈就算成功
+  await recordVisibleText(app, agent)
+
+  const line = app.logs.find((entry) => entry.message.includes('自愈成功'))?.message
+  assert.ok(line !== undefined, '正常走完应当结清这次自愈')
+  assert.ok(line.includes('熔断 1 次'), line)
+  assert.ok(line.includes('重发 1 次'), line)
+  assert.ok(line.includes('救回 1 次'), line)
+  assert.ok(line.includes('100%'), line)
+})
+
+test('自愈统计：重发之后又打转 → 不算救回（不能自欺）', async () => {
+  const agent = fakeAgent()
+  const app = mount({}, { compaction: fakeCompaction({ effect: (t) => t.touch(1) }) })
+
+  await drain(
+    app.stream({ sessionId: agent.session.id }, () => streamOf(textDeltas(longLineLoop(150), 32)).source),
+  )
+  await app.waterfall('agent/request-error', tripPayload(agent), () => 'terminal')
+  // 重发之后**又**熔断：那笔「等着看」应当作废
+  await drain(
+    app.stream({ sessionId: agent.session.id }, () => streamOf(textDeltas(longLineLoop(150), 32)).source),
+  )
+  // 之后再正常走完，也不能替它结账
+  await recordVisibleText(app, agent)
+
+  assert.ok(
+    !app.logs.some((entry) => entry.message.includes('自愈成功')),
+    '又一次熔断之后不该冒出成功记录 —— 否则成功率就是自欺',
+  )
+})
+
+test('自愈统计：没有发生过熔断时不会有成功记录', async () => {
+  const agent = fakeAgent()
+  const app = mount({})
+  await recordVisibleText(app, agent)
+  assert.ok(!app.logs.some((entry) => entry.message.includes('自愈成功')))
 })
 
 // ---------------------------------------------------------------------------

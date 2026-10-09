@@ -133,6 +133,14 @@ export const DEFAULT_CONFIG = Object.freeze({
      * 代价是一条百来字的 user 消息 —— 相比压缩省下来的空间可以忽略。
      */
     explainFailure: true,
+    /**
+     * 救不回来时，给用户留一句人话。
+     *
+     * 此时这一轮会以 `error` 结束，界面上原本只有一句技术错误
+     * （「检测到短句打转（正文流）…」）。补一句「发生了什么 + 你可以怎么办」，
+     * 用户才不至于对着一行异常发呆。
+     */
+    reportGiveUp: true,
   },
   /**
    * 「没说完就停」的补救。
@@ -178,6 +186,13 @@ export const DEFAULT_CONFIG = Object.freeze({
       '[系统自动提醒] 你上一条消息停在中途：话没说完，也没有发起工具调用。' +
       '请接着上一条继续完成 —— 该调用工具的调用工具，该写完的继续写完；' +
       '不要重复已经写过的内容，也不要重新开始。',
+    /**
+     * 提醒次数用满、只能放行时，给用户留一句人话。
+     *
+     * 这时界面上是「模型说了半句就没下文了」——用户多半会以为是自己的问题。
+     * 说明一句「我催过它，它没接着写」，比让用户对着半截回答发呆强。
+     */
+    reportGiveUp: true,
   },
   /**
    * 「短句打转」检测。
@@ -223,6 +238,14 @@ export const DEFAULT_CONFIG = Object.freeze({
 
 /** 「说没说正文」记账表的最大条数（防止长期运行时无限增长）。 */
 const MAX_ATTEMPT_ENTRIES = 512
+
+/**
+ * 「一次自愈算不算成功」的时间窗（毫秒）。
+ *
+ * 重发之后如果隔了太久才有下一次正常调用，中间多半夹了别的事情，说不清到底
+ * 是不是这一救起了作用 —— 那种一律不算成功，宁可把成功率算低。
+ */
+const RECOVERY_WINDOW_MS = 600000
 
 /**
  * 判断一个值是不是「可以当对象用」的东西。
@@ -522,6 +545,43 @@ export function createTailBuffer(limitChars) {
 }
 
 /**
+ * 结清一次悬着的自愈：这次调用正常走完了，说明那次重发确实救回来了。
+ *
+ * 为什么要单独立一个函数：**这是「自愈」这个词唯一可被证伪的依据**。
+ * 没有它，我们只能看见「熔断了 12 次」，永远不知道其中几次真的救回来了 ——
+ * 那「自愈」就只是一句自我表扬。
+ *
+ * @param {object} ctx - Cordis 上下文。
+ * @param {object} cfg - 生效配置。
+ * @param {object} runtime - 运行期共享状态。
+ * @param {string} sessionId - 会话 id。
+ * @returns {void}
+ */
+function settleRecovery(ctx, cfg, runtime, sessionId) {
+  const pending = runtime.pending.get(sessionId)
+  if (pending === undefined) return
+  runtime.pending.delete(sessionId)
+
+  // 太老的不算：中间可能已经夹了别的调用，说不清到底是谁救的。
+  // 宁可少记一次成功（成功率偏保守），也不要记一次假成功。
+  if (typeof pending.at === 'number' && Date.now() - pending.at > RECOVERY_WINDOW_MS) return
+
+  runtime.stats.recovered += 1
+
+  const { trips, retries, recovered } = runtime.stats
+  const rate = retries === 0 ? 0 : Math.round((recovered / retries) * 100)
+  logLine(
+    ctx,
+    cfg,
+    'info',
+    '自愈成功：重发之后这次没有再打转' +
+      (typeof pending.code === 'string' ? '（上次是 ' + pending.code + '）' : '') +
+      '。累计：熔断 ' + String(trips) + ' 次 / 重发 ' + String(retries) +
+      ' 次 / 救回 ' + String(recovered) + ' 次（成功率 ' + String(rate) + '%）。',
+  )
+}
+
+/**
  * 包住一条上游模型流，实时检查「是不是跑飞了」。
  *
  * 两道检查：
@@ -535,12 +595,13 @@ export function createTailBuffer(limitChars) {
  *
  * @param {object} ctx - Cordis 上下文。
  * @param {object} cfg - 生效配置。
+ * @param {object} runtime - 运行期共享状态（记账表 / 待验证的自愈 / 统计）。
  * @param {object} options - GenerateOptions（本次请求的全部参数）。
  * @param {AsyncIterable<object>} source - 上游流。
- * @param {Map<string, object>} attempts - 「说没说正文」的记账表。
  * @returns {AsyncIterable<object>} 受保护、并在正常结束时记账的流。
  */
-async function* healStream(ctx, cfg, options, source, attempts) {
+async function* healStream(ctx, cfg, runtime, options, source) {
+  const attempts = runtime.attempts
   const startedAt = Date.now()
   // 思考流与正文流各自独立计数，理由见上面第 1 点。
   // 每条流上挂两条检测线：严格复读（字符级 / 行级）+ 短句打转。
@@ -674,10 +735,17 @@ async function* healStream(ctx, cfg, options, source, attempts) {
         finishKind,
         tailText: tailBuffer === null ? '' : tailBuffer.text(),
       })
+      // 这次调用正常走完了 —— 如果它是一次熔断之后的「重发」，那一次自愈就算成功。
+      settleRecovery(ctx, cfg, runtime, sessionId)
     }
   }
 
   if (trip !== null) {
+    runtime.stats.trips += 1
+    // 又熔断了：上一次那笔「等着看这次行不行」作废 —— 它显然没被救回来。
+    // 少了这一步，后面某次正常调用会替它结账，成功率就成了假的。
+    const trippedId = options?.sessionId
+    if (typeof trippedId === 'string') runtime.pending.delete(trippedId)
     const route = String(options?.provider ?? '?') + '/' + String(options?.model ?? '?')
     const detail = trip.detail === undefined ? '' : ' ' + trip.detail
     logLine(
@@ -838,6 +906,80 @@ function appendToHistory(agent, message) {
 }
 
 /**
+ * 熔断 code → 给用户看的中文说法。
+ *
+ * 界面上不该出现 `SELF_HEAL_LOOP` 这种东西 —— 用户需要知道的是「出了什么事」。
+ */
+const TRIP_LABELS = Object.freeze({
+  [CODES.repeat]: '复读（同一段内容被反复写）',
+  [CODES.loop]: '短句打转（反复复述同一批短句）',
+  [CODES.timeout]: '超时（一次输出迟迟不结束）',
+})
+
+/**
+ * 往会话历史里写一条本插件的说明消息。
+ *
+ * 所有「写消息」的动作都走这里，好处是失败处理只有一处：写不进去就记一行日志、
+ * 返回 false，**绝不让说明消息本身把主流程带崩**。
+ *
+ * @param {object} ctx - Cordis 上下文。
+ * @param {object} cfg - 生效配置。
+ * @param {object} agent - 目标 agent。
+ * @param {string} text - 说明正文。
+ * @param {string} summary - 一句话摘要。
+ * @returns {boolean} 是否写入成功。
+ */
+function appendNotice(ctx, cfg, agent, text, summary) {
+  try {
+    return appendToHistory(agent, createNoticeMessage(text, summary))
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    logLine(ctx, cfg, 'warn', '写说明消息失败（' + message + '），照常继续。')
+    return false
+  }
+}
+
+/**
+ * 熔断救不回来时，给用户留一句人话。
+ *
+ * 为什么需要：放弃之后这一轮会以 `error` 结束，界面上原本只有一句技术错误
+ * （「检测到短句打转（正文流）…」）。用户需要的是「发生了什么 + 我能做什么」。
+ *
+ * @param {object} ctx - Cordis 上下文。
+ * @param {object} cfg - 生效配置。
+ * @param {object} agent - 目标 agent。
+ * @param {number} attempts - 一共救了几次。
+ * @param {unknown} failure - 最后一次的失败信息。
+ * @returns {boolean} 是否写入成功。
+ */
+function reportTripGiveUp(ctx, cfg, agent, attempts, failure) {
+  if (cfg.recover.reportGiveUp !== true) return false
+  const why = isObject(failure) && typeof failure.code === 'string' ? TRIP_LABELS[failure.code] : undefined
+  const text =
+    '（失控自愈）模型连续 ' + String(attempts) + ' 次陷入' + (why ?? '失控') +
+    '，已停止本次输出。可以试试把任务拆小一点，或者换个说法再问一次 —— ' +
+    '重复问同样的问题，很可能还会卡在同一处。'
+  return appendNotice(ctx, cfg, agent, text, '自愈放弃：给用户的说明')
+}
+
+/**
+ * 「没说完就停」催不动时，给用户留一句人话。
+ *
+ * @param {object} ctx - Cordis 上下文。
+ * @param {object} cfg - 生效配置。
+ * @param {object} agent - 目标 agent。
+ * @param {number} attempts - 一共提醒了几次。
+ * @returns {boolean} 是否写入成功。
+ */
+function reportUnfinishedGiveUp(ctx, cfg, agent, attempts) {
+  if (cfg.unfinished.reportGiveUp !== true) return false
+  const text =
+    '（失控自愈）模型连续 ' + String(attempts) + ' 次没把话说完，已放行本次结束。' +
+    '可以回一句「继续」让它接着写，或者把问题拆小一点再问。'
+  return appendNotice(ctx, cfg, agent, text, '未完成补救放弃：给用户的说明')
+}
+
+/**
  * 把「刚才为什么失败」告诉模型，让这次重发不是盲目的。
  *
  * 任何一步失败都只是「这次不带诊断」，绝不影响重发本身 —— 诊断是锦上添花，
@@ -853,13 +995,7 @@ function explainFailure(ctx, cfg, agent, failure) {
   if (cfg.recover.explainFailure !== true) return false
   const text = isObject(failure) ? DIAGNOSIS_MESSAGES[failure.code] : undefined
   if (typeof text !== 'string') return false
-  try {
-    return appendToHistory(agent, createNoticeMessage(text, '熔断诊断：告诉模型刚才发生了什么'))
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error)
-    logLine(ctx, cfg, 'warn', '写诊断消息失败（' + message + '），照常重发。')
-    return false
-  }
+  return appendNotice(ctx, cfg, agent, text, '熔断诊断：告诉模型刚才发生了什么')
 }
 
 /**
@@ -875,7 +1011,7 @@ function explainFailure(ctx, cfg, agent, failure) {
  * @param {object} cfg - 生效配置。
  * @returns {void}
  */
-function installRunawayRecovery(ctx, cfg) {
+function installRunawayRecovery(ctx, cfg, runtime) {
   /** agent → 本轮已恢复次数。用 WeakMap：agent 被回收时记录自动消失。 */
   const used = new WeakMap()
 
@@ -895,6 +1031,8 @@ function installRunawayRecovery(ctx, cfg) {
       const already = state !== undefined && state.turn === turn ? state.count : 0
       if (already >= cfg.recover.maxAttempts) {
         logLine(ctx, cfg, 'warn', '本轮已恢复 ' + String(already) + ' 次仍未成功，停止重试并把错误交还给上层。')
+        // 到此为止了：这一轮会以 error 结束，给用户留一句人话再走。
+        reportTripGiveUp(ctx, cfg, agent, already, payload?.failure)
         return next()
       }
 
@@ -934,6 +1072,19 @@ function installRunawayRecovery(ctx, cfg) {
       const explained = explainFailure(ctx, cfg, agent, payload?.failure)
 
       used.set(agent, { turn, count: already + 1 })
+
+      // 记一笔「等着看这次行不行」：下一次调用**正常走完**就算救回来了。
+      // 这是「自愈成功率」唯一的数据来源 —— 没有它，我们只能看见熔断了几次，
+      // 永远不知道到底救回来几次。
+      runtime.stats.retries += 1
+      const sessionId = agent?.session?.id
+      if (typeof sessionId === 'string') {
+        runtime.pending.set(sessionId, {
+          code: isObject(payload?.failure) ? payload.failure.code : undefined,
+          at: Date.now(),
+        })
+      }
+
       logLine(
         ctx,
         cfg,
@@ -1039,7 +1190,8 @@ async function compactBeforeContinue(ctx, cfg, agent, signal, already) {
  * @param {Map<string, object>} attempts - 「这次调用输出了什么」的记账表。
  * @returns {void}
  */
-function installUnfinishedRescue(ctx, cfg, attempts) {
+function installUnfinishedRescue(ctx, cfg, runtime) {
+  const attempts = runtime.attempts
   /** agent → 本轮已提醒次数。 */
   const strikes = new WeakMap()
 
@@ -1067,6 +1219,8 @@ function installUnfinishedRescue(ctx, cfg, attempts) {
           'warn',
           '模型连续没把话说完（判定依据 ' + hit.kind + '），已达到提醒上限，放行结束本轮。',
         )
+        // 催不动了：这一轮会「正常结束」在半截话上，给用户留一句人话。
+        reportUnfinishedGiveUp(ctx, cfg, agent, already)
         return
       }
       strikes.set(agent, { turn, count: already + 1 })
@@ -1187,8 +1341,20 @@ export function apply(ctx, config) {
     return
   }
 
-  /** 「最近一次普通对话调用说没说正文」，按 sessionId 记账。 */
-  const attempts = new Map()
+  /**
+   * 运行期共享状态。
+   *
+   * 打包成一个对象在几条链路之间传，而不是散着传三四个 Map —— 否则每加一项
+   * 统计就要改一圈函数签名，容易漏改。
+   */
+  const runtime = {
+    /** 「最近一次普通对话调用说没说正文」，按 sessionId 记账。 */
+    attempts: new Map(),
+    /** 「刚重发过、等着看这次行不行」：sessionId → { code, at }。 */
+    pending: new Map(),
+    /** 跨会话累计的介入统计 —— 自愈成功率的唯一来源。 */
+    stats: { trips: 0, retries: 0, recovered: 0 },
+  }
 
   ctx.on(
     'llm/stream',
@@ -1196,13 +1362,13 @@ export function apply(ctx, config) {
       const source = next()
       // 不是异步可迭代对象（下游没给流）就原样透传，绝不改写别人的返回值。
       if (!isObject(source) || typeof source[Symbol.asyncIterator] !== 'function') return source
-      return healStream(ctx, cfg, options, source, attempts)
+      return healStream(ctx, cfg, runtime, options, source)
     },
     { global: true },
   )
 
-  installRunawayRecovery(ctx, cfg)
-  installUnfinishedRescue(ctx, cfg, attempts)
+  installRunawayRecovery(ctx, cfg, runtime)
+  installUnfinishedRescue(ctx, cfg, runtime)
   installToolLoopRescue(ctx, cfg)
 
   logLine(
