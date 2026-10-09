@@ -16,9 +16,12 @@ import assert from 'node:assert/strict'
 import {
   LINE_DEFAULTS,
   REPEAT_DEFAULTS,
+  SENTENCE_LOOP_DEFAULTS,
   UNFINISHED_DEFAULTS,
   createRepeatDetector,
+  createSentenceLoopDetector,
   detectInTail,
+  detectSentenceLoop,
   detectUnfinished,
   findRepeatingLineBlock,
   findRepeatingPeriod,
@@ -462,7 +465,282 @@ test('参数自洽：未完成识别的默认参数合理', () => {
 })
 
 // ---------------------------------------------------------------------------
-// 5. 性能
+// 5. 短句打转（「好。／行动。／（调用。）／NOW.」几百行）
+//
+//    与上一组同样的取向：**「不许误报」比「必须命中」更重要**。
+//    打断一次正常输出是不可逆的（用户正看着回答就被掐断重来），所以下面这些
+//    正常样本一个都不许被误判。**用户明确要求过：宁可漏判，也别打断。**
+// ---------------------------------------------------------------------------
+
+/**
+ * 真实事故形态：每次措辞略有不同，但翻来覆去就是那几句超短句。
+ * 原子取自真实截图（思考流里连着几百行）。
+ */
+function shortLoop(lines) {
+  const atoms = [
+    '好。',
+    '行动。',
+    '执行。',
+    '写。',
+    '我调用工具。',
+    'Go.',
+    '（真的调用了。）好。',
+    'NOW.',
+    '（调用。）',
+    '我调用 write 工具。',
+    '我调用。',
+    'CALL.',
+    'GO!',
+    '（我停止循环。）',
+    '好，调用。',
+    '（调用 write。）',
+    'CALLING.',
+    'DONE.',
+    '（我真的必须停止。直接调用 write 工具。）',
+  ]
+  const out = []
+  let seed = 20261009
+  for (let i = 0; i < lines; i += 1) {
+    seed = (seed * 1103515245 + 12345) % 2147483648
+    const pick = seed / 2147483648
+    // 真实样本里「好。」占大头，这里也让它更频繁。
+    out.push(atoms[pick < 0.45 ? 0 : Math.floor(pick * atoms.length)])
+  }
+  return out.join('\n')
+}
+
+/** 正常的对话式回复：短句很多，但每句内容都不同。 */
+function chitChat() {
+  const out = []
+  for (let i = 1; i <= 80; i += 1) {
+    out.push('好，我来看第 ' + i + ' 个文件里的 ' + ((i * 37) % 991) + ' 行配置。')
+    out.push('这里的字段名和文档对不上第 ' + i + ' 处。')
+    out.push('改成 ' + ((i * 53) % 997) + ' 之后就能跑通了。')
+  }
+  return out.join('\n')
+}
+
+/** 正常的步骤清单（行都很短）。 */
+function checklist() {
+  const out = []
+  for (let i = 1; i <= 60; i += 1) {
+    out.push(i + '. 打开第 ' + i + ' 个配置文件并检查端口 ' + (8000 + i) + ' 是否被占用')
+  }
+  return out.join('\n')
+}
+
+/** 正常代码（短行多、符号重复多）。 */
+function sampleCode() {
+  const out = []
+  for (let i = 0; i < 200; i += 1) {
+    out.push('function handler_' + i + '(req, res) {')
+    out.push('  // 处理第 ' + i + ' 类请求')
+    out.push('  if (!req.body) return res.status(400).end();')
+    out.push('  return res.json({ ok: true, id: ' + i + ' });')
+    out.push('}')
+    out.push('')
+  }
+  return out.join('\n')
+}
+
+/** 正常表格。 */
+function sampleTable() {
+  const out = ['| 模块 | 状态 | 备注 |', '| --- | --- | --- |']
+  for (let i = 1; i <= 60; i += 1) {
+    out.push('| 模块' + i + ' | 通过 | 第 ' + i + ' 轮回归 |')
+  }
+  return out.join('\n')
+}
+
+/** 正常报告：短句多，但每句内容都不同。 */
+function shortReport() {
+  const out = []
+  for (let i = 1; i <= 60; i += 1) {
+    out.push('第 ' + i + ' 项通过。')
+    out.push('耗时 ' + i * 7 + ' 毫秒。')
+  }
+  return out.join('\n')
+}
+
+/**
+ * 口头禅型：同一句短句反复出现，但正文主体是正常长句。
+ *
+ * ⚠️ 这是第一版判据栽过的地方：只统计短句、把长句当分母丢掉的话，
+ * 这条样本的「重复率」会算成 100%，直接误报。现在靠「短句密度」拦住它。
+ */
+function withCatchphrases() {
+  const out = []
+  for (let i = 1; i <= 60; i += 1) {
+    out.push('好的。')
+    out.push('第 ' + i + ' 个模块的检查结果是第 ' + ((i * 31) % 997) + ' 号状态，需要继续观察。')
+  }
+  return out.join('\n')
+}
+
+test('短句打转：真实形态必命中（400 行 / 800 行）', () => {
+  for (const lines of [400, 800]) {
+    const text = shortLoop(lines)
+    const hit = detectSentenceLoop(text)
+    assert.ok(hit !== null, lines + ' 行的短句打转必须被认出来（样本 ' + text.length + ' 字符）')
+    assert.ok(hit.repeatRatio >= SENTENCE_LOOP_DEFAULTS.minRepeatRatio)
+  }
+})
+
+test('短句打转：真实抄录片段（72 行，逐字）必命中', () => {
+  const snippet = `好。
+行动。
+执行。
+好。
+我调用工具。
+好。
+Go.
+（真的调用了。）好。
+NOW.
+（调用。）
+好。
+CALL.
+我调用 write 工具写简体脚本。
+好。
+行动。
+（调用。）
+好。
+我调用。
+好。
+（调用 write。）
+好。
+NOW!
+（我停止循环。）
+好，调用。
+好。
+行动。
+我调用。
+好。
+（调用 write。）
+好。
+GO!
+好。
+（调用。）
+好。
+我调用 write 工具。
+好。
+行动。
+（调用。）
+好。
+NOW.
+好。
+我调用。
+（调用 write 工具。）
+好。
+CALLING.
+好。
+行动。
+（调用。）
+好。
+我调用 write。
+好。
+（调用。）
+好。
+GO.
+好，我调用工具。
+好。
+行动。
+（调用。）
+好。
+NOW!
+好。
+（我直接调用 write 工具。）
+好。
+行动。
+（调用。）
+好。
+CALL.
+好。
+行动。
+（调用。）
+好。
+我调用 write 工具写脚本。`
+  const hit = detectSentenceLoop(snippet)
+  assert.ok(hit !== null, '逐字抄录的真实片段也必须命中')
+  assert.ok(hit.topCount >= 10, '最高频句应当出现很多次，实际 ' + hit.topCount)
+})
+
+test('短句打转：正常输出一律放过（这是最重要的一组）', () => {
+  assert.equal(detectSentenceLoop(variedProse(400)), null, '正常中文叙述')
+  assert.equal(detectSentenceLoop(chitChat()), null, '短句很多的正常对话')
+  assert.equal(detectSentenceLoop(checklist()), null, '步骤清单')
+  assert.equal(detectSentenceLoop(sampleCode()), null, '代码')
+  assert.equal(detectSentenceLoop(sampleTable()), null, '表格')
+  assert.equal(detectSentenceLoop(shortReport()), null, '短句很多但各不相同的报告')
+})
+
+test('短句打转：口头禅不许误报（第一版判据的翻车点）', () => {
+  assert.equal(
+    detectSentenceLoop(withCatchphrases()),
+    null,
+    '「一句口头禅 + 一堆长句」是正常写法：短句密度不够，必须放过',
+  )
+})
+
+test('短句打转：太短的输出根本不判', () => {
+  assert.equal(detectSentenceLoop('好的。\n我看了一下。\n问题在配置里。\n已经修好了。'), null)
+  assert.equal(detectSentenceLoop(''), null)
+  assert.equal(detectSentenceLoop(undefined), null)
+})
+
+test('短句打转：关掉开关后完全不判', () => {
+  assert.equal(detectSentenceLoop(shortLoop(400), { enabled: false }), null)
+})
+
+test('短句打转：必须连续两次判定都命中才动手（单次波动一律放过）', () => {
+  // 只出现一小段重复、随后立刻恢复正常 —— 不允许打断。
+  const brief = shortLoop(160) + '\n' + variedProse(200)
+  const detector = createSentenceLoopDetector()
+  let hitAt = 0
+  for (let i = 0; i < brief.length; i += 16) {
+    if (detector.push(brief.slice(i, i + 16)) !== null) {
+      hitAt = detector.chars()
+      break
+    }
+  }
+  assert.equal(hitAt, 0, '短暂重复几句之后恢复正常，绝不能被打断')
+})
+
+test('短句打转：持续打转必须能在合理范围内被抓住', () => {
+  const text = shortLoop(600)
+  const detector = createSentenceLoopDetector()
+  let hitAt = 0
+  for (let i = 0; i < text.length; i += 16) {
+    if (detector.push(text.slice(i, i + 16)) !== null) {
+      hitAt = detector.chars()
+      break
+    }
+  }
+  assert.ok(hitAt >= SENTENCE_LOOP_DEFAULTS.minChars, '不该在门槛之前动手')
+  assert.ok(hitAt < text.length, '持久打转必须被抓住（实际在 ' + hitAt + ' 字符处）')
+})
+
+test('短句打转：非法输入一律返回未命中', () => {
+  const detector = createSentenceLoopDetector()
+  assert.equal(detector.push(''), null)
+  assert.equal(detector.push(null), null)
+  assert.equal(detector.push(undefined), null)
+  assert.equal(detector.push(12345), null)
+  assert.equal(detector.chars(), 0, '非法输入不得计入字符数')
+})
+
+test('短句打转：门槛与确认轮数必须足够保守', () => {
+  assert.ok(
+    SENTENCE_LOOP_DEFAULTS.minChars < REPEAT_DEFAULTS.minChars,
+    '短句打转的启动门槛应低于复读（否则同样的毛病要晚三千字符才被抓）',
+  )
+  assert.ok(SENTENCE_LOOP_DEFAULTS.confirmRounds >= 2, '至少要连续确认两次才允许打断用户')
+  assert.ok(SENTENCE_LOOP_DEFAULTS.minShortRatio >= 0.8, '短句密度门槛必须够高，否则口头禅会误报')
+  assert.ok(SENTENCE_LOOP_DEFAULTS.minRepeat >= 4, '同一句只说两三次不算打转')
+  assert.ok(SENTENCE_LOOP_DEFAULTS.windowChars >= 4096, '窗口太小会看不到足够多的句子')
+})
+
+// ---------------------------------------------------------------------------
+// 6. 性能
 // ---------------------------------------------------------------------------
 
 test('性能：10 万次小分片 push 必须很快（每个 token 级分片都会调它）', () => {

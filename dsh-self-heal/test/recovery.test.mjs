@@ -22,6 +22,20 @@ import assert from 'node:assert/strict'
 import { CODES } from '../lib/index.js'
 import { drain, fakeAgent, fakeCompaction, liveSignal, mount, streamOf, textDeltas } from './harness.mjs'
 
+/**
+ * 造一段「严格复读、但不会被短句打转那条线抢先」的样本。
+ *
+ * 短句打转检测的启动门槛只有 1000 字符（比复读的 4000 低），且专盯「平均行长
+ * 很短」的形态；所以要让本文件精确地测「复读 → 熔断」链路，样本必须是长行重复。
+ *
+ * @param {number} times - 重复多少行。
+ * @returns {string} 样本文本。
+ */
+function longLineLoop(times) {
+  const line = '这是一段刻意写得很长的重复内容，用来把平均行长拉到预检门槛之上，只让复读检测那条线负责抓它。'
+  return Array.from({ length: times }, () => line).join('\n')
+}
+
 /** 造一条「只思考、不说话」的模型流。 */
 function reasoningOnly(text) {
   return [
@@ -730,7 +744,7 @@ test('完整链路：熔断 → 压缩 → 重试 → 这次正常收尾', async
   const app = mount({}, { compaction })
 
   // 1) 第一次请求：复读，被熔断。
-  const loop = Array.from({ length: 600 }, () => 'Let me run.').join('\n')
+  const loop = longLineLoop(150)
   const seen = await drain(
     app.stream({ sessionId: agent.session.id }, () => streamOf(textDeltas(loop, 32)).source),
   )

@@ -588,3 +588,263 @@ export function detectUnfinished(finishKind, tailText, opts = {}) {
 
   return null
 }
+
+/* ══════════════════════════════════════════════════════════════════════════
+ *  第三部分：短句打转识别 ——「同一批超短句反复出现」
+ *
+ *  现场长这样（思考流里的真实截图，节选）：
+ *
+ *      好。
+ *      行动。
+ *      执行。
+ *      好。
+ *      我调用工具。
+ *      好。
+ *      Go.
+ *      （真的调用了。）好。
+ *      NOW.
+ *      （调用。）
+ *      ……几百行都是这个
+ *
+ *  模型嘴上一直说「我调用 write 工具」，却始终没有真的去调，一轮就这么烧完了。
+ *
+ *  ⚠️ 前两部分为什么抓不到它：那两部分都要求**严格重复** —— 相同的字符，或
+ *  相同的行块，反复出现。而这里每次措辞都在微调（「我调用。」→「我调用 write
+ *  工具。」→「（调用。）」→「NOW CALLING.」），严格周期根本不存在。
+ *
+ *  它能被认出来的是**统计特征**，不是重复模式：
+ *
+ *    ① 平均行长极短 —— 正常长文的平均行长是几十个字符，这里只有几个；
+ *    ② 短句密度高 —— 文本里几乎每一句都是超短句，没有正常的长句；
+ *    ③ 重复率高 —— 这些短句里很大一部分是同一批句子在反复出现。
+ *
+ *  三条**同时成立**才判命中。少一条都宁可放过 —— 本文件从第一部分到第三部分
+ *  贯彻同一个原则：**宁可漏判，也不要误报**。误报会让正常回答被无端掐断，
+ *  比漏判难受得多。
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * 「短句打转」检测的默认参数。
+ *
+ * ⚠️ 这组数字的取向是**极度保守**：宁可漏判，也绝不能把一次正常输出打断。
+ * 因为「打断」的代价是不可逆的 —— 用户正看着回答，突然被掐断重来；而漏判
+ * 最多是多烧一点 token。所以这里要求的条件很苛刻（见下面每一条的注释），
+ * 并且额外加了「连续两次判定都命中才动手」的确认机制。
+ *
+ * 每一个数字都是拿真实形态的样本对照量出来的：循环样本必须命中，九个正常
+ * 样本（长文、对话、清单、代码、表格、短回复、报告、口头禅）必须全部放过。
+ * 改动这些数字前请先跑一遍对照。
+ */
+export const SENTENCE_LOOP_DEFAULTS = Object.freeze({
+  enabled: true,
+  /**
+   * 输出累计到这么多字符才开始判定。
+   *
+   * 比复读门槛（4000）低，但也**不低到危险**：1500 字符以下的输出根本不看，
+   * 短回复永远不受影响。
+   */
+  minChars: 1500,
+  /** 每新增这么多字符才判一次（节流）。 */
+  checkEveryChars: 1000,
+  /** 判定窗口（字符）：只看尾部这么多内容。 */
+  windowChars: 8192,
+  /**
+   * 平均行长上限（字符/行）。
+   *
+   * 这是**最便宜的预检**：只数换行，不做任何切句。正常长文的平均行长在
+   * 20~60 字符，一眼就能排除；只有「一堆碎片」的形态才会低于这个值。
+   */
+  maxAverageLineChars: 16,
+  /** 多长的句子还算「短句」（超过就不参与重复统计）。 */
+  maxSentenceChars: 24,
+  /** 同一个短句至少出现几次才算「重复句」。 */
+  minRepeat: 4,
+  /** 窗口里至少要有这么多短句才判定（样本太少不看）。 */
+  minSentences: 50,
+  /** 短句密度门槛：短句要占**全部**句子的这么大比例（长句也算分母，防止塌缩）。 */
+  minShortRatio: 0.85,
+  /** 重复率门槛：短句里要有这么大比例是重复句。 */
+  minRepeatRatio: 0.6,
+  /**
+   * 连续命中几次才真的熔断。
+   *
+   * 这是最后一道闸：统计判定难免有波动（比如模型只是碰巧连着说了几句一样的话），
+   * 单独一次命中不足以打断用户。要求**下一次判定（再输出 checkEveryChars 个
+   * 字符之后）依然命中**，才认定「它确实卡住了，而且没自己爬出来」。
+   *
+   * 代价是晚约 1000 字符动手；对真实的几百行打转（通常几千字符起步）
+   * 完全够用，对「只是重复了几句」则是救命的。
+   */
+  confirmRounds: 2,
+})
+
+/**
+ * 半角代码符号。
+ *
+ * 为什么用它们来排除：一段代码切出来的「句子」长这样 —— `if (`、`res.json({`、
+ * `}`。它们要么含字母却明显不是句子，要么干脆是纯符号。
+ * 中文里的全角括号（`（调用。）`）是正常表达，所以**不**在这个名单里。
+ */
+const CODE_CHARS = /[(){}[\]<>;=|\\/`$%&*+_#~^]/
+
+/**
+ * 数一段文本有多少行（数换行符的个数）。
+ *
+ * 为什么手写循环而不用 `split('\n').length`：后者会分配一个大数组，而这个函数
+ * 每个判定点都要跑一次。数换行只需要一次扫描、零分配。
+ *
+ * @param {string} text - 待数文本。
+ * @returns {number} 行数（一个换行都没有时算 1 行）。
+ */
+function countLines(text) {
+  let lines = 1
+  let at = text.indexOf('\n')
+  while (at !== -1) {
+    lines += 1
+    at = text.indexOf('\n', at + 1)
+  }
+  return lines
+}
+
+/**
+ * 判断一段文本是不是「短句打转」。
+ *
+ * @param {string} tail - 文本（通常传入尾部窗口）。
+ * @param {object} [opts] - 见 {@link SENTENCE_LOOP_DEFAULTS}。
+ * @returns {{sentences: number, short: number, repeated: number, repeatRatio: number,
+ *   shortRatio: number, averageLineChars: number, top: string, topCount: number}|null}
+ *   命中时返回统计明细（供日志写清楚「凭什么判的」）；没命中返回 null。
+ */
+export function detectSentenceLoop(tail, opts = {}) {
+  const cfg = { ...SENTENCE_LOOP_DEFAULTS, ...opts }
+  if (cfg.enabled !== true) return null
+  if (typeof tail !== 'string' || tail === '') return null
+
+  const window = tail.length > cfg.windowChars ? tail.slice(-cfg.windowChars) : tail
+
+  // ── ① 廉价预检：平均行长 ────────────────────────────────────────────────
+  // 正常长文根本不需要往下切句，这一步把它的成本压到几微秒。
+  const averageLineChars = window.length / countLines(window)
+  if (averageLineChars > cfg.maxAverageLineChars) return null
+
+  // ── ② 切句并统计 ────────────────────────────────────────────────────────
+  const counts = new Map()
+  let sentences = 0
+  let short = 0
+  for (const line of window.split('\n')) {
+    for (const raw of line.split(/[。！？!?]+/)) {
+      const sentence = raw.trim()
+      // 空片段、纯符号片段（`}`、`）`）、代码片段统统不算「句子」。
+      if (sentence === '') continue
+      if (!/[A-Za-z\u4e00-\u9fa5]/.test(sentence)) continue
+      if (CODE_CHARS.test(sentence)) continue
+      sentences += 1
+      // 长句只计入总数（当分母），不参与重复统计 —— 正常的长句内容各不相同。
+      if (sentence.length > cfg.maxSentenceChars) continue
+      short += 1
+      counts.set(sentence, (counts.get(sentence) ?? 0) + 1)
+    }
+  }
+
+  if (short < cfg.minSentences) return null
+
+  // ── ③ 两条比例都要过 ────────────────────────────────────────────────────
+  // 短句密度是关键的闸门：没有它，「一句口头禅 + 一堆长句」的回复会因为长句
+  // 被当作分母丢掉，让重复率虚高（实测能到 100%，直接误报）。
+  const shortRatio = short / sentences
+  if (shortRatio < cfg.minShortRatio) return null
+
+  let repeated = 0
+  let top = ''
+  let topCount = 0
+  for (const [sentence, count] of counts) {
+    if (count >= cfg.minRepeat) repeated += count
+    if (count > topCount) {
+      topCount = count
+      top = sentence
+    }
+  }
+
+  const repeatRatio = repeated / short
+  if (repeatRatio < cfg.minRepeatRatio) return null
+
+  return { sentences, short, repeated, repeatRatio, shortRatio, averageLineChars, top, topCount }
+}
+
+/**
+ * 创建一个带节流的「短句打转」检测器。
+ *
+ * 用法与 {@link createRepeatDetector} 完全一样：每收到一小段输出就 `push(文本)`，
+ * 它自己攒缓冲、自己决定什么时候真正判定。两条检测线各用一个实例，互不干扰。
+ *
+ * @param {object} [opts] - 见 {@link SENTENCE_LOOP_DEFAULTS}。
+ * @returns {{push: (text: string) => object|null, chars: () => number, reset: () => void}} 检测器。
+ */
+export function createSentenceLoopDetector(opts) {
+  const cfg = { ...SENTENCE_LOOP_DEFAULTS, ...opts }
+
+  /** 已并进窗口的尾部文本（只保留窗口大小）。 */
+  let tail = ''
+  /** 已收到、但还没并进窗口的片段。 */
+  const pending = []
+  let total = 0
+  let lastCheck = 0
+  let armed = false
+  /** 连续命中了几次（见 confirmRounds）。中间只要有一次不命中就清零。 */
+  let streak = 0
+
+  return {
+    /**
+     * 追加一段增量文本，必要时做一次判定。
+     * @param {string} text - 增量文本。
+     * @returns {object|null} 命中明细；未命中（或还需再确认一次）返回 null。
+     */
+    push(text) {
+      if (cfg.enabled !== true) return null
+      if (typeof text !== 'string' || text.length === 0) return null
+      total += text.length
+      pending.push(text)
+
+      if (!armed) {
+        if (total < cfg.minChars) return null
+        armed = true
+      } else if (total - lastCheck < cfg.checkEveryChars) {
+        return null
+      }
+      lastCheck = total
+
+      // 与复读检测同样的「先攒后并」：判定窗口有 8KB，不能每个分片都重拼一次。
+      if (pending.length > 0) {
+        tail = tail + pending.join('')
+        pending.length = 0
+        if (tail.length > cfg.windowChars) tail = tail.slice(-cfg.windowChars)
+      }
+
+      const hit = detectSentenceLoop(tail, cfg)
+      if (hit === null) {
+        // 它自己爬出来了（或者本来就不是打转）—— 重新计数。
+        streak = 0
+        return null
+      }
+      streak += 1
+      // 还差几次确认：先不打断，等下一次判定。
+      if (streak < cfg.confirmRounds) return null
+      return hit
+    },
+
+    /** @returns {number} 累计喂入的字符数。 */
+    chars() {
+      return total
+    },
+
+    /** 清空累计状态（换一条流时用）。 */
+    reset() {
+      tail = ''
+      pending.length = 0
+      total = 0
+      lastCheck = 0
+      armed = false
+      streak = 0
+    },
+  }
+}

@@ -31,6 +31,94 @@ function variedProse(count) {
   return out.join('\n')
 }
 
+/**
+ * 正常但「句句都短」的输出：每一句都不重复。
+ *
+ * 用途：证明短句打转那条线**不会**误伤这类输出 —— 它能通过平均行长预检、
+ * 短句密度也是 100%，唯一缺的就是「重复」。
+ *
+ * @param {number} count - 生成多少轮。
+ * @returns {string} 样本文本。
+ */
+function normalShortProse(count) {
+  const out = []
+  for (let i = 1; i <= count; i += 1) {
+    out.push('第 ' + i + ' 项检查通过。')
+    out.push('耗时 ' + ((i * 17) % 997) + ' 毫秒。')
+  }
+  return out.join('\n')
+}
+
+/**
+ * 口头禅式输出：一句短口头禅反复出现，但正文主体是正常长句。
+ * @param {number} count - 生成多少轮。
+ * @returns {string} 样本文本。
+ */
+function catchphraseProse(count) {
+  const out = []
+  for (let i = 1; i <= count; i += 1) {
+    out.push('好的。')
+    out.push('第 ' + i + ' 个模块的检查结果是第 ' + ((i * 31) % 997) + ' 号状态，需要继续观察后续变化。')
+  }
+  return out.join('\n')
+}
+
+/**
+ * 造一段「严格复读、但不会被短句打转那条线抢先」的样本。
+ *
+ * ⚠️ 为什么行必须写长：短句打转检测的启动门槛只有 1000 字符（比复读的 4000
+ * 低），而且它专门盯「平均行长很短」的形态。若这里仍用 `Let me run.` 这种短行，
+ * 两条线都能抓它，测试就分不清究竟是谁在动手了。长行的平均行长超过预检门槛，
+ * 短句打转那条线根本不看它 —— 于是这个样本**只**考验复读。
+ *
+ * @param {number} times - 重复多少行。
+ * @returns {string} 样本文本。
+ */
+function longLineLoop(times) {
+  const line = '这是一段刻意写得很长的重复内容，用来把平均行长拉到预检门槛之上，只让复读检测那条线负责抓它。'
+  return Array.from({ length: times }, () => line).join('\n')
+}
+
+/**
+ * 造一段「短句打转」的样本：每次措辞都略有不同，但翻来覆去就是那几句超短句。
+ * 原子取自真实事故截图（思考流里连着几百行）。
+ *
+ * @param {number} lines - 生成多少行。
+ * @returns {string} 样本文本。
+ */
+function shortLoop(lines) {
+  const atoms = [
+    '好。',
+    '行动。',
+    '执行。',
+    '写。',
+    '我调用工具。',
+    'Go.',
+    '（真的调用了。）好。',
+    'NOW.',
+    '（调用。）',
+    '我调用 write 工具。',
+    '我调用。',
+    'CALL.',
+    'GO!',
+    '（我停止循环。）',
+    '好，调用。',
+    '（调用 write。）',
+    'CALLING.',
+    'DONE.',
+    '（我真的必须停止。直接调用 write 工具。）',
+  ]
+  const out = []
+  let seed = 20261009
+  for (let i = 0; i < lines; i += 1) {
+    seed = (seed * 1103515245 + 12345) % 2147483648
+    const pick = seed / 2147483648
+    // 「好。」在真实样本里占大头，这里也让它出现得更频繁。
+    out.push(atoms[pick < 0.45 ? 0 : Math.floor(pick * atoms.length)])
+  }
+  return out.join('\n')
+}
+
 // ---------------------------------------------------------------------------
 
 test('集成：正常流逐块原样放行，并保留提供方自己的 finish', async () => {
@@ -74,7 +162,7 @@ test('集成：没有单次输出上限 —— 40 万字符的正常中文输出
 test('集成：复读触发 SELF_HEAL_REPEAT 并关闭上游', async () => {
   // 必须越过 minChars 门槛（默认 4000 字符），否则检测器按设计根本不会启动 ——
   // 短输出即使重复也无所谓，不值得为它打断一次正常回答。
-  const loop = Array.from({ length: 800 }, () => 'Let me run.').join('\n')
+  const loop = longLineLoop(200)
   assert.ok(loop.length > 4000, '样本必须超过复读检测的启动门槛，当前 ' + loop.length)
   const chunks = textDeltas(loop, 32)
   const { stream } = mount({})
@@ -97,7 +185,7 @@ test('集成：思考内容不得掩盖正文复读（实测漏网的根因）',
     { length: 200 },
     (_, i) => '第 ' + i + ' 步推理：先确认 ' + ((i * 7) % 97) + ' 号文件的字段含义，再决定是否继续。',
   ).join('\n')
-  const loop = Array.from({ length: 400 }, () => 'Let me run.').join('\n')
+  const loop = longLineLoop(100)
   assert.ok(reasoning.length > 4000, '思考样本应超过启动门槛，当前 ' + reasoning.length)
   assert.ok(loop.length > 4000, '正文样本应超过启动门槛，当前 ' + loop.length)
 
@@ -115,7 +203,7 @@ test('集成：思考内容不得掩盖正文复读（实测漏网的根因）',
 })
 
 test('集成：思考流自己的复读同样会被拦下', async () => {
-  const loop = Array.from({ length: 600 }, () => '让我再确认一下这个字段的含义。').join('\n')
+  const loop = longLineLoop(150)
   const chunks = textDeltas(loop, 32).map((chunk) => ({ ...chunk, type: 'reasoning-delta' }))
   const { stream } = mount({})
   const seen = await drain(stream(OPTIONS, () => streamOf(chunks).source))
@@ -123,6 +211,58 @@ test('集成：思考流自己的复读同样会被拦下', async () => {
   const last = seen[seen.length - 1]
   assert.equal(last.type, 'finish')
   assert.equal(last.reason.failure.code, CODES.repeat)
+})
+
+test('集成：短句打转（措辞每次都在变）触发 SELF_HEAL_LOOP', async () => {
+  // 真实事故现场：思考流里连着几百行「好。／行动。／（调用。）／NOW.」，
+  // 每次措辞都略有不同 —— 严格周期不存在，只有「短句打转」这条线能抓。
+  const loop = shortLoop(400)
+  assert.ok(loop.length > 1000, '样本必须超过短句打转的启动门槛，当前 ' + loop.length)
+  const chunks = textDeltas(loop, 16)
+  const { stream } = mount({})
+  const { source, state } = streamOf(chunks)
+  const seen = await drain(stream(OPTIONS, () => source))
+
+  const last = seen[seen.length - 1]
+  assert.equal(last.type, 'finish')
+  assert.equal(last.reason.kind, 'error')
+  assert.equal(last.reason.failure.code, CODES.loop)
+  assert.equal(state.closed, true, '熔断后必须关闭上游')
+  assert.ok(state.pulled < chunks.length, '不应把上游全部读完')
+})
+
+test('集成：短句打转比复读更早动手（同一个毛病省下更多 token）', async () => {
+  // 短行重复的样本两条线都能抓，但短句打转的门槛是 1500 字符、复读是 4000，
+  // 所以先动手的是前者。这是有意为之：越早掐掉越省。
+  const loop = Array.from({ length: 800 }, () => 'Let me run.').join('\n')
+  const { stream } = mount({})
+  const seen = await drain(stream(OPTIONS, () => streamOf(textDeltas(loop, 32)).source))
+  assert.equal(seen[seen.length - 1].reason.failure.code, CODES.loop)
+})
+
+test('集成：短句很多但内容不同的正常输出，绝不能被打断', async () => {
+  // 用户最担心的事：说到一半被掐断。这个样本「句句都短」（能通过平均行长预检、
+  // 短句密度 100%），唯一缺的就是「重复」—— 所以必须原样放行到最后一块。
+  const body = normalShortProse(300)
+  const chunks = [...textDeltas(body, 16), { type: 'finish', reason: { kind: 'stop' } }]
+  const { stream } = mount({})
+  const { source, state } = streamOf(chunks)
+  const seen = await drain(stream(OPTIONS, () => source))
+
+  assert.equal(seen[seen.length - 1].reason.kind, 'stop', '必须是提供方自己的正常收尾')
+  // 读完整条流是「没被熔断」的硬证据：熔断会提前 break，上游根本读不完。
+  assert.equal(state.pulled, chunks.length, '上游必须被读到最后一块')
+})
+
+test('集成：口头禅式的正常输出也不能被打断', async () => {
+  // 「好的。」重复 60 次、重复率 100% —— 只看重复率就会误报的形态。
+  // 但它旁边全是正常长句，短句密度不够，必须放过。
+  const body = catchphraseProse(80)
+  const chunks = [...textDeltas(body, 16), { type: 'finish', reason: { kind: 'stop' } }]
+  const { stream } = mount({})
+  const { source, state } = streamOf(chunks)
+  await drain(stream(OPTIONS, () => source))
+  assert.equal(state.pulled, chunks.length, '口头禅是正常写法，上游必须被读完')
 })
 
 test('集成：墙钟超时触发 SELF_HEAL_TIMEOUT', async () => {

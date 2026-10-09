@@ -10,9 +10,12 @@
 import {
   LINE_DEFAULTS,
   REPEAT_DEFAULTS,
+  SENTENCE_LOOP_DEFAULTS,
   UNFINISHED_DEFAULTS,
   createRepeatDetector,
+  createSentenceLoopDetector,
   detectInTail,
+  detectSentenceLoop,
   detectUnfinished,
 } from '../lib/detect.js'
 import { createTailBuffer } from '../lib/index.js'
@@ -298,3 +301,120 @@ console.log('')
 console.log('说明：三个数字里绝大部分是「构造与消费几万个对象」的固有成本 —— 真正属于')
 console.log('      检测的部分请看第三节与第五节。新增功能摊到每个分片上只有亚微秒级，')
 console.log('      相对于一次真实模型调用的耗时（秒级）完全可以忽略。')
+
+console.log('')
+console.log('='.repeat(78))
+console.log('八、短句打转：什么样的会接上、什么样的绝对不碰')
+console.log('='.repeat(78))
+console.log('现场是思考流里连着几百行「好。／行动。／（调用。）／NOW.」——')
+console.log('每次措辞都略有不同，严格周期不存在，只能靠统计特征认。')
+console.log('')
+
+/**
+ * 造一段真实形态的短句打转（原子取自真实截图）。
+ * @param {number} lines - 行数。
+ * @returns {string} 样本文本。
+ */
+function shortLoopText(lines) {
+  const atoms = [
+    '好。', '行动。', '执行。', '写。', '我调用工具。', 'Go.', 'NOW.', '（调用。）',
+    '我调用 write 工具。', '我调用。', 'CALL.', 'GO!', '（我停止循环。）', '好，调用。',
+    'CALLING.', 'DONE.', '（我真的必须停止。直接调用 write 工具。）',
+  ]
+  const out = []
+  let seed = 20261009
+  for (let i = 0; i < lines; i += 1) {
+    seed = (seed * 1103515245 + 12345) % 2147483648
+    const pick = seed / 2147483648
+    out.push(atoms[pick < 0.45 ? 0 : Math.floor(pick * atoms.length)])
+  }
+  return out.join('\n')
+}
+
+/** 短句很多、但每句都不重复的正常输出。 */
+function normalShortLines() {
+  const out = []
+  for (let i = 1; i <= 120; i += 1) {
+    out.push('第 ' + i + ' 项检查通过。')
+    out.push('耗时 ' + ((i * 17) % 997) + ' 毫秒。')
+  }
+  return out.join('\n')
+}
+
+/** 口头禅式输出：一句短口头禅反复出现，旁边全是正常长句。 */
+function catchphraseLines() {
+  const out = []
+  for (let i = 1; i <= 60; i += 1) {
+    out.push('好的。')
+    out.push('第 ' + i + ' 个模块的检查结果是第 ' + ((i * 31) % 997) + ' 号状态，需要继续观察。')
+  }
+  return out.join('\n')
+}
+
+/** 正常步骤清单。 */
+function stepLines() {
+  const out = []
+  for (let i = 1; i <= 60; i += 1) {
+    out.push(i + '. 打开第 ' + i + ' 个配置文件并检查端口 ' + (8000 + i) + ' 是否被占用')
+  }
+  return out.join('\n')
+}
+
+/** 正常代码。 */
+function codeLines() {
+  const out = []
+  for (let i = 0; i < 120; i += 1) {
+    out.push('function handler_' + i + '(req, res) {')
+    out.push('  if (!req.body) return res.status(400).end();')
+    out.push('  return res.json({ ok: true, id: ' + i + ' });')
+    out.push('}')
+  }
+  return out.join('\n')
+}
+
+const loopCases = [
+  ['短句打转（真实形态 400 行）', shortLoopText(400)],
+  ['短句打转（真实形态 800 行）', shortLoopText(800)],
+  ['短句多但各不重复', normalShortLines()],
+  ['口头禅 + 一堆长句', catchphraseLines()],
+  ['正常步骤清单', stepLines()],
+  ['正常代码', codeLines()],
+  ['正常中文长文', variedProse(400)],
+]
+
+for (const [label, text] of loopCases) {
+  const hit = detectSentenceLoop(text)
+  const verdict =
+    hit === null
+      ? '放过（不打断）'
+      : '接上（' + String(hit.short) + ' 个短句，重复率 ' + (hit.repeatRatio * 100).toFixed(0) + '%）'
+  console.log('  ' + label.padEnd(26) + String(text.length).padStart(7) + ' 字符   ' + verdict)
+}
+
+// 最能说明「不会误伤」的一条：重复一小段之后自己恢复了正常。
+const recoverDetector = createSentenceLoopDetector()
+const recovered = shortLoopText(120) + '\n' + variedProse(300)
+let recoveredTrip = false
+for (let i = 0; i < recovered.length; i += 16) {
+  if (recoverDetector.push(recovered.slice(i, i + 16)) !== null) {
+    recoveredTrip = true
+    break
+  }
+}
+console.log('')
+console.log(
+  '  打转一小段后又恢复正常 → ' +
+    (recoveredTrip ? '被打断（不应发生！）' : '安全放行（连续确认机制把它放过了）'),
+)
+
+console.log('')
+console.log('要动手必须同时满足这些条件（缺一条就放过）：')
+console.log('  ① 累计输出 ≥ ' + SENTENCE_LOOP_DEFAULTS.minChars + ' 字符；')
+console.log('  ② 平均行长 ≤ ' + SENTENCE_LOOP_DEFAULTS.maxAverageLineChars + ' 字符（正常长文通常是 20~60，直接出局）；')
+console.log('  ③ ≥ ' + SENTENCE_LOOP_DEFAULTS.minSentences + ' 个短句（≤ ' + SENTENCE_LOOP_DEFAULTS.maxSentenceChars + ' 字符），且短句占全部句子 ≥ ' +
+  (SENTENCE_LOOP_DEFAULTS.minShortRatio * 100) + '%；')
+console.log('  ④ 短句里 ≥ ' + (SENTENCE_LOOP_DEFAULTS.minRepeatRatio * 100) + '% 是重复句（同一句出现 ≥ ' + SENTENCE_LOOP_DEFAULTS.minRepeat + ' 次）；')
+console.log('  ⑤ **连续 ' + SENTENCE_LOOP_DEFAULTS.confirmRounds + ' 次判定都命中** —— 单次波动一律放过。')
+console.log('')
+console.log('换句话说：正常输出哪怕句句都短、哪怕里面有口头禅，只要内容在往前走（不重复），')
+console.log('这条线就完全不会碰它。')

@@ -60,8 +60,10 @@ import { randomUUID } from 'node:crypto'
 import {
   LINE_DEFAULTS,
   REPEAT_DEFAULTS,
+  SENTENCE_LOOP_DEFAULTS,
   UNFINISHED_DEFAULTS,
   createRepeatDetector,
+  createSentenceLoopDetector,
   detectUnfinished,
 } from './detect.js'
 
@@ -82,11 +84,15 @@ export const inject = []
  *
  * 刻意全部避开 `dsh-llm-retry` 的默认可重试白名单，好处有两个：
  *   1. 官方重试不会把一个已经失控的请求再放大五遍；
- *   2. 我们自己能凭这两个代码，在 `agent/request-error` 里一眼认出「这是我的
+ *   2. 我们自己能凭这几个代码，在 `agent/request-error` 里一眼认出「这是我的
  *      熔断」，从而接管恢复流程。
+ *
+ * `repeat`（严格复读）与 `loop`（短句打转）走的是同一套恢复链路，分开只为
+ * 了日志里能一眼看出是哪种毛病。
  */
 export const CODES = Object.freeze({
   repeat: 'SELF_HEAL_REPEAT',
+  loop: 'SELF_HEAL_LOOP',
   timeout: 'SELF_HEAL_TIMEOUT',
 })
 
@@ -160,6 +166,24 @@ export const DEFAULT_CONFIG = Object.freeze({
       '请接着上一条继续完成 —— 该调用工具的调用工具，该写完的继续写完；' +
       '不要重复已经写过的内容，也不要重新开始。',
   },
+  /**
+   * 「短句打转」检测。
+   *
+   * 与 `repeat` / `lines` 的区别：那两条要求**严格重复**（同样的字符或同样的
+   * 行块反复出现），只能抓「复读」。这里抓的是另一种失控 —— 同一批**超短句**
+   * 反复出现，但每次措辞都略有不同，例如思考流里连着几百行：
+   *
+   *     好。
+   *     行动。
+   *     （调用。）
+   *     NOW.
+   *     我调用 write 工具。
+   *     ……（嘴上一直说要调工具，始终没调）
+   *
+   * 严格周期在这里根本不存在，只能靠统计特征认（平均行长、短句密度、重复率
+   * 三条同时成立）。判据细节与阈值来历见 `lib/detect.js` 第三部分。
+   */
+  loop: SENTENCE_LOOP_DEFAULTS,
 })
 
 /** 「说没说正文」记账表的最大条数（防止长期运行时无限增长）。 */
@@ -246,6 +270,7 @@ export function resolveConfig(config) {
       isObject(raw.unfinished) ? raw.unfinished : legacyUnfinished(raw),
     ),
     repeat: mergeConfig(REPEAT_DEFAULTS, raw.repeat),
+    loop: mergeConfig(SENTENCE_LOOP_DEFAULTS, raw.loop),
     lines: mergeConfig(LINE_DEFAULTS, raw.lines),
   }
 }
@@ -482,9 +507,14 @@ export function createTailBuffer(limitChars) {
 async function* healStream(ctx, cfg, options, source, attempts) {
   const startedAt = Date.now()
   // 思考流与正文流各自独立计数，理由见上面第 1 点。
+  // 每条流上挂两条检测线：严格复读（字符级 / 行级）+ 短句打转。
+  const makeDetectors = () => ({
+    repeat: createRepeatDetector(cfg.repeat, cfg.lines),
+    loop: createSentenceLoopDetector(cfg.loop),
+  })
   const detectors = new Map([
-    ['text-delta', createRepeatDetector(cfg.repeat, cfg.lines)],
-    ['reasoning-delta', createRepeatDetector(cfg.repeat, cfg.lines)],
+    ['text-delta', makeDetectors()],
+    ['reasoning-delta', makeDetectors()],
   ])
   const iterator = source[Symbol.asyncIterator]()
 
@@ -557,18 +587,35 @@ async function* healStream(ctx, cfg, options, source, attempts) {
 
       if (text !== null) {
         const bucket = detectors.get(chunk.type)
-        const hit = bucket === undefined ? null : bucket.push(text)
-        if (hit !== null) {
+        if (bucket !== undefined) {
           const where = chunk.type === 'reasoning-delta' ? '思考流' : '正文流'
-          trip = {
-            code: CODES.repeat,
-            message: '检测到持续性复读（' + where + '），判定为思考循环。',
-            detail:
-              hit.kind === 'char-period'
-                ? '(字符级周期 ' + String(hit.period) + ' 字符)'
-                : '(行级周期 ' + String(hit.periodLines) + ' 行 × ' + String(hit.repeats) + ' 次)',
+
+          // 第一道：严格复读 —— 同样的字符或同样的行块反复出现。
+          const hit = bucket.repeat.push(text)
+          if (hit !== null) {
+            trip = {
+              code: CODES.repeat,
+              message: '检测到持续性复读（' + where + '），判定为思考循环。',
+              detail:
+                hit.kind === 'char-period'
+                  ? '(字符级周期 ' + String(hit.period) + ' 字符)'
+                  : '(行级周期 ' + String(hit.periodLines) + ' 行 × ' + String(hit.repeats) + ' 次)',
+            }
+            break
           }
-          break
+
+          // 第二道：短句打转 —— 措辞每次都略变，但翻来覆去就是那几句超短句。
+          const loopHit = bucket.loop.push(text)
+          if (loopHit !== null) {
+            trip = {
+              code: CODES.loop,
+              message: '检测到短句打转（' + where + '）：同一批超短句反复出现，判定为卡住。',
+              detail:
+                '(' + String(loopHit.short) + ' 个短句里有 ' + String(loopHit.repeated) +
+                ' 个是重复句，最高频「' + loopHit.top + '」×' + String(loopHit.topCount) + ')',
+            }
+            break
+          }
         }
       }
     }
@@ -665,14 +712,21 @@ function compactionFor(ctx, agent) {
 }
 
 /**
+ * 本插件的全部熔断代码。
+ *
+ * 直接由 {@link CODES} 派生：以后新增一种熔断只要往 CODES 里加一项，
+ * 下面的判断会自动跟上 —— 少写一处就会「熔断了却没人接手恢复」，很难查。
+ */
+const TRIP_CODES = new Set(Object.values(CODES))
+
+/**
  * 判断一次失败是不是「本插件给出的熔断」。
  * @param {unknown} failure - 失败信息。
  * @returns {boolean} 是否为本插件的熔断 code。
  */
 function isSelfHealTrip(failure) {
   if (!isObject(failure)) return false
-  const code = failure.code
-  return code === CODES.repeat || code === CODES.timeout
+  return TRIP_CODES.has(failure.code)
 }
 
 /**
@@ -979,6 +1033,8 @@ export function apply(ctx, config) {
       (cfg.maxDurationMs > 0 ? String(Math.round(cfg.maxDurationMs / 1000)) + 's' : '关') +
       '，复读检测 ' +
       (cfg.repeat.enabled || cfg.lines.enabled ? '开' : '关') +
+      '，短句打转检测 ' +
+      (cfg.loop.enabled ? '开' : '关') +
       '，熔断后压缩并重试 ' +
       (cfg.recover.enabled ? '开' : '关') +
       '，没说完就继续的补救 ' +
