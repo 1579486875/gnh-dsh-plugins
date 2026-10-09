@@ -61,9 +61,11 @@ import {
   LINE_DEFAULTS,
   REPEAT_DEFAULTS,
   SENTENCE_LOOP_DEFAULTS,
+  TOOL_LOOP_DEFAULTS,
   UNFINISHED_DEFAULTS,
   createRepeatDetector,
   createSentenceLoopDetector,
+  createToolLoopTracker,
   detectUnfinished,
 } from './detect.js'
 
@@ -120,6 +122,17 @@ export const DEFAULT_CONFIG = Object.freeze({
      * 的区间时（例如对话还很短），重发一次的成本很低，而救回来的价值很高。
      */
     retryWithoutCompaction: true,
+    /**
+     * 重发之前，把「你刚才为什么失败」写进会话告诉模型。
+     *
+     * 为什么值得做：重复坍缩是**近乎确定性的吸引子** —— 同样的上下文，会再次
+     * 滑进同一个循环里。盲目重发（压完就重发）很可能原样再犯一次，只是白烧
+     * 一遍 token。把病类说清楚、再给一句**定向指令**（「接着没写过的部分写」／
+     * 「立刻执行你刚才说要做的动作」），才算是真的把它从吸引子里拽出来。
+     *
+     * 代价是一条百来字的 user 消息 —— 相比压缩省下来的空间可以忽略。
+     */
+    explainFailure: true,
   },
   /**
    * 「没说完就停」的补救。
@@ -184,6 +197,28 @@ export const DEFAULT_CONFIG = Object.freeze({
    * 三条同时成立）。判据细节与阈值来历见 `lib/detect.js` 第三部分。
    */
   loop: SENTENCE_LOOP_DEFAULTS,
+  /**
+   * 「工具调用打转」的提醒（动作层）。
+   *
+   * 与 DSH 自带的 `dsh-repeat-tool-reminder` 分工：它管「同一个工具、完全相同的
+   * 参数连续调用 N 次」；这里管它覆盖不到的两种 —— 多工具形成的**环**
+   * （A→B→C→A→B→C），以及参数**近似但不完全相同**的重复。
+   *
+   * **只提醒，不熔断**：动作层误判的代价比文本层更高 —— 一次误判会让模型丢掉
+   * 正在推进的思路。所以这里只往下一步塞一句话，决策权仍然留给模型。
+   */
+  tools: {
+    ...TOOL_LOOP_DEFAULTS,
+    /**
+     * 提醒正文；会作为**附加上下文**跟着工具结果一起交回给模型。
+     *
+     * 文案刻意只说「怎么做」：换办法，或者把卡点讲清楚 —— 这两条都能让它跳出
+     * 原来的动作序列。
+     */
+    message:
+      '[系统自动提醒] 你已经在重复同一套动作了（同样的几个工具、参数也几乎一样，已经走了好几遍）。' +
+      '如果问题还没解决，说明这个思路走不通：请换一个办法，或者把当前卡在哪一步说清楚，不要再重复同样的调用。',
+  },
 })
 
 /** 「说没说正文」记账表的最大条数（防止长期运行时无限增长）。 */
@@ -271,6 +306,7 @@ export function resolveConfig(config) {
     ),
     repeat: mergeConfig(REPEAT_DEFAULTS, raw.repeat),
     loop: mergeConfig(SENTENCE_LOOP_DEFAULTS, raw.loop),
+    tools: mergeConfig(DEFAULT_CONFIG.tools, raw.tools),
     lines: mergeConfig(LINE_DEFAULTS, raw.lines),
   }
 }
@@ -763,6 +799,70 @@ function historyChanged(surface, mark) {
 }
 
 /**
+ * 熔断诊断文案：按「刚才出了什么毛病」给模型一句可执行的指令。
+ *
+ * 每一条都刻意包含两件事：**发生了什么** + **接下来具体怎么做**。
+ * 只说「你复读了」没有用 —— 模型需要知道的是往哪个方向改。
+ *
+ * 导出它是为了让测试能钉住「每个熔断 code 都必须有文案」—— 以后新增一种
+ * 熔断却忘了写文案，会导致重发退化成盲目重试，而这种退化在运行时是静默的。
+ */
+export const DIAGNOSIS_MESSAGES = Object.freeze({
+  [CODES.repeat]:
+    '[系统自动提醒] 你刚才陷入了复读：同一段内容被反复写了很多遍。系统已中断那次输出，并把上文压缩过了。' +
+    '请接着往下写还没写过的部分 —— 不要重复已经出现过的内容，也不要从头重来。',
+  [CODES.loop]:
+    '[系统自动提醒] 你刚才卡在了「反复复述同一批短句」上（例如一直说要去调用工具，却始终没有真的调用）。' +
+    '请立刻执行你刚才说过要做的那个动作：该调用工具就直接调用，不要再用文字描述计划，也不要重复已经说过的话。',
+  [CODES.timeout]:
+    '[系统自动提醒] 上一次输出耗时过长，被判定为失控并中断了。系统已压缩上文。' +
+    '请直接给出结论或下一步动作，不要再展开长篇推演。',
+})
+
+/**
+ * 把一条提醒**直接写进会话历史**（而不是投进收件箱）。
+ *
+ * 为什么不用 `agent.steer`：steer 只是把消息放进收件箱，要等下一步被领取才会
+ * 进入历史；而我们的目的是让**紧接着那次重发**就能看到它。直接写进 surface，
+ * 重发时重建请求必然带上它。
+ *
+ * @param {object} agent - 目标 agent。
+ * @param {object} message - 已冻结的消息（见 {@link createNoticeMessage}）。
+ * @returns {boolean} 是否写入成功。
+ */
+function appendToHistory(agent, message) {
+  const session = agent?.session
+  if (!isObject(session) || typeof session.append !== 'function') return false
+  session.append('user/message', message, { surfaceOp: 'append' })
+  return true
+}
+
+/**
+ * 把「刚才为什么失败」告诉模型，让这次重发不是盲目的。
+ *
+ * 任何一步失败都只是「这次不带诊断」，绝不影响重发本身 —— 诊断是锦上添花，
+ * 不能让它的异常把恢复链路带崩。
+ *
+ * @param {object} ctx - Cordis 上下文。
+ * @param {object} cfg - 生效配置。
+ * @param {object} agent - 目标 agent。
+ * @param {unknown} failure - 失败信息（含本插件的熔断 code）。
+ * @returns {boolean} 是否成功写入了诊断。
+ */
+function explainFailure(ctx, cfg, agent, failure) {
+  if (cfg.recover.explainFailure !== true) return false
+  const text = isObject(failure) ? DIAGNOSIS_MESSAGES[failure.code] : undefined
+  if (typeof text !== 'string') return false
+  try {
+    return appendToHistory(agent, createNoticeMessage(text, '熔断诊断：告诉模型刚才发生了什么'))
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    logLine(ctx, cfg, 'warn', '写诊断消息失败（' + message + '），照常重发。')
+    return false
+  }
+}
+
+/**
  * 安装「熔断之后救回来」的恢复逻辑，挂在 `agent/request-error` 上。
  *
  * 完整流程：
@@ -828,6 +928,11 @@ function installRunawayRecovery(ctx, cfg) {
         return next()
       }
 
+      // ★ 把「刚才为什么失败」写进历史，让这次重发不盲目。
+      //   顺序刻意放在压缩**之后**：这样诊断不会被这次压缩顺手摘要掉，
+      //   紧接着的那次重发一定看得到它。
+      const explained = explainFailure(ctx, cfg, agent, payload?.failure)
+
       used.set(agent, { turn, count: already + 1 })
       logLine(
         ctx,
@@ -835,6 +940,7 @@ function installRunawayRecovery(ctx, cfg) {
         'info',
         '已从熔断中恢复：' +
           (progressed ? '历史已压缩，' : '历史没有可压缩的区间，') +
+          (explained ? '已把失败原因告诉模型，' : '') +
           '重新发送请求（本轮第 ' + String(already + 1) + ' 次）。',
       )
       return { kind: 'retry' }
@@ -994,6 +1100,79 @@ function installUnfinishedRescue(ctx, cfg, attempts) {
 }
 
 /**
+ * 安装「工具调用打转」的提醒，挂在 `tools/post-execute` 上。
+ *
+ * 为什么挂在这里而不是 steer：工具刚执行完，把这条提醒作为**附加上下文**交给
+ * 下一步，模型的下一次请求就会看到它 —— 这正是 DSH 自带 `dsh-repeat-tool-reminder`
+ * 用的机制（我们与它**同一机制、不同判据**），而且比 steer 更贴合时机。
+ *
+ * ⚠️ 只提醒、不熔断：动作层误判的代价比文本层更高，一次误判会让模型丢掉正在
+ * 推进的思路。所以这里只往上下文里塞一句话，怎么走仍然由模型决定。
+ *
+ * @param {object} ctx - Cordis 上下文。
+ * @param {object} cfg - 生效配置。
+ * @returns {void}
+ */
+function installToolLoopRescue(ctx, cfg) {
+  /** agent → 追踪器。用 WeakMap：agent 被回收时记录自动消失。 */
+  const trackers = new WeakMap()
+
+  ctx.on('tools/post-execute', async (exec, _result, next) => {
+    // 先让下游把这一环走完，再决定要不要往里加东西 —— 绝不改写别人的语义。
+    const downstream = await next()
+    if (cfg.tools.enabled !== true) return downstream
+    try {
+      const agent = exec?.agent
+      if (!isObject(agent)) return downstream
+
+      let tracker = trackers.get(agent)
+      if (tracker === undefined) {
+        tracker = createToolLoopTracker(cfg.tools)
+        trackers.set(agent, tracker)
+      }
+
+      const hit = tracker.push({ tool: exec.name, args: exec.arguments })
+      if (hit === null) return downstream
+
+      const notice = createNoticeMessage(
+        cfg.tools.message,
+        '工具调用打转：' + hit.cycle.join(' → ') + ' × ' + String(hit.repeats),
+      )
+      logLine(
+        ctx,
+        cfg,
+        'info',
+        '工具调用打转：' + hit.cycle.join(' → ') + ' 已重复 ' + String(hit.repeats) + ' 遍，已注入提醒。',
+      )
+
+      // 原样保持下游返回值的形状：block 分支要把 feedback 一起带上。
+      const existing = Array.isArray(downstream?.additionalContexts) ? downstream.additionalContexts : []
+      const merged = [notice, ...existing]
+      if (downstream?.kind === 'block') {
+        return { kind: 'block', feedback: downstream.feedback, additionalContexts: merged }
+      }
+      return isObject(downstream) ? { ...downstream, additionalContexts: merged } : { additionalContexts: merged }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      logLine(ctx, cfg, 'warn', '工具打转提醒失败（' + message + '），照常继续。')
+      return downstream
+    }
+  })
+
+  // 用户插了新话 → 这是一次新的意图，历史清零，别拿旧账判它。
+  // （我们自己的提醒 source.kind 是 'self-heal'，不会被误当成用户消息。）
+  ctx.on('agent/pre-step', (payload, next) => {
+    const agent = payload?.agent
+    const messages = payload?.messages
+    if (isObject(agent) && Array.isArray(messages) && messages.some((message) => message?.source?.kind === 'user')) {
+      const tracker = trackers.get(agent)
+      if (tracker !== undefined) tracker.reset()
+    }
+    return next()
+  })
+}
+
+/**
  * 安装插件。
  *
  * @param {object} ctx - Cordis 上下文。
@@ -1024,6 +1203,7 @@ export function apply(ctx, config) {
 
   installRunawayRecovery(ctx, cfg)
   installUnfinishedRescue(ctx, cfg, attempts)
+  installToolLoopRescue(ctx, cfg)
 
   logLine(
     ctx,
@@ -1035,6 +1215,8 @@ export function apply(ctx, config) {
       (cfg.repeat.enabled || cfg.lines.enabled ? '开' : '关') +
       '，短句打转检测 ' +
       (cfg.loop.enabled ? '开' : '关') +
+      '，工具调用打转提醒 ' +
+      (cfg.tools.enabled ? '开' : '关') +
       '，熔断后压缩并重试 ' +
       (cfg.recover.enabled ? '开' : '关') +
       '，没说完就继续的补救 ' +

@@ -163,15 +163,30 @@ export function textDeltas(text, size) {
  */
 export function fakeAgent(opts = {}) {
   const steered = []
+  const appended = []
   const surface = {
     replaceGeneration: opts.replace ?? 0,
     contentGeneration: opts.content ?? 0,
   }
   return {
-    session: { id: opts.id ?? 'session-1', surface },
+    session: {
+      id: opts.id ?? 'session-1',
+      surface,
+      /**
+       * 记录「被直接写进会话历史」的消息。
+       *
+       * 与 steer 的区别：steer 是投进收件箱（要等下一步被领取才进历史），
+       * append 是**立刻进历史** —— 熔断诊断走的就是这条路，为的是让紧接着
+       * 那次重发一定能看到它。
+       */
+      append(kind, message, options) {
+        appended.push({ kind, message, options })
+      },
+    },
     options: { provider: 'deepseek-official', model: 'deepseek-v4-flash' },
     presetServices: {},
     steered,
+    appended,
     /** 记录被投递的 steering（提醒）消息。 */
     steer(message) {
       steered.push(message)

@@ -17,7 +17,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 
-import { CODES, DEFAULT_CONFIG, resolveConfig } from '../lib/index.js'
+import { CODES, DEFAULT_CONFIG, DIAGNOSIS_MESSAGES, createNoticeMessage, resolveConfig } from '../lib/index.js'
 import { drain, mount, streamOf, textDeltas } from './harness.mjs'
 
 const OPTIONS = { provider: 'deepseek-official', model: 'deepseek-v4-flash', sessionId: 'session-1' }
@@ -417,4 +417,24 @@ test('配置：unfinished 组的开关与类型校验', () => {
   assert.equal(cfg.unfinished.promises, false)
   assert.equal(cfg.unfinished.tailChars, 2048)
   assert.equal(cfg.unfinished.silent, DEFAULT_CONFIG.unfinished.silent, '类型不对的值必须退回默认，而不是变成真值')
+})
+
+test('配置：每个熔断 code 都必须配一条诊断文案', () => {
+  const cfg = resolveConfig({})
+  assert.equal(cfg.recover.explainFailure, true, '默认应当开启「把失败原因告诉模型」')
+  for (const code of Object.values(CODES)) {
+    const text = DIAGNOSIS_MESSAGES[code]
+    assert.equal(typeof text, 'string', code + ' 缺少诊断文案 —— 重发会退化成盲目重试')
+    // 太短的文案起不到指路作用：必须说清「发生了什么」并给出方向。
+    assert.ok(text.length > 40, code + ' 的诊断文案太短，模型看不出该往哪改')
+  }
+})
+
+test('配置：诊断文案本身也要能构造成合法消息', () => {
+  for (const code of Object.values(CODES)) {
+    const message = createNoticeMessage(DIAGNOSIS_MESSAGES[code], '诊断')
+    assert.equal(message.role, 'user')
+    assert.equal(message.source.kind, 'self-heal')
+    assert.ok(Object.isFrozen(message))
+  }
 })

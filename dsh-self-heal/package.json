@@ -1,7 +1,7 @@
 {
   "name": "dsh-self-heal",
-  "version": "0.4.0",
-  "description": "DSH 失控自愈：复读、短句打转或墙钟超时熔断后自动压缩对话并重试续跑；模型没把话说完（只思考不说话，或说了一半就停）时，先压缩上下文腾地方、再注入提醒让它接着写完。挂在 host 组合上，覆盖所有会话与子代理的模型调用。",
+  "version": "0.5.0",
+  "description": "DSH 失控自愈：复读、短句打转或墙钟超时熔断后，先压缩上下文、把失败原因告诉模型再重试；模型没把话说完时先压缩再提醒它接着写完；工具调用出现环时注入提醒。挂在 host 组合上，覆盖所有会话与子代理的模型调用。",
   "keywords": [
     "dsh",
     "dsh-plugin",
@@ -21,7 +21,8 @@
   "scripts": {
     "test": "node --test test/detect.test.mjs test/integration.test.mjs test/recovery.test.mjs",
     "contract": "node test/contract-check.mjs",
-    "diagnose": "node test/diagnose.mjs"
+    "diagnose": "node test/diagnose.mjs",
+    "calibrate": "node test/calibrate.mjs"
   },
   "engines": {
     "node": ">=20"

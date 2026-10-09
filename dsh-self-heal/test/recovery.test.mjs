@@ -331,6 +331,115 @@ test('恢复：agentPresets.serviceFor 抛异常时自动退到下一条路', as
 })
 
 // ---------------------------------------------------------------------------
+// A2. 重发不是盲目的：把「刚才为什么失败」写进历史
+//
+//     重复坍缩是近乎确定性的吸引子 —— 同样的上下文会再次滑进同一个循环。
+//     压完就重发的盲目重试大概率原样再犯，所以重发前必须把病类告诉模型，
+//     并给一句可执行的定向指令。
+// ---------------------------------------------------------------------------
+
+test('恢复：重发前把诊断写进会话历史（不是投收件箱）', async () => {
+  const agent = fakeAgent()
+  const compaction = fakeCompaction({ effect: (target) => target.touch(1) })
+  const app = mount({}, { compaction })
+
+  const action = await app.waterfall('agent/request-error', tripPayload(agent), () => 'terminal')
+
+  assert.deepEqual(action, { kind: 'retry' })
+  assert.equal(agent.appended.length, 1, '必须往历史里写一条诊断')
+  const written = agent.appended[0]
+  assert.equal(written.kind, 'user/message')
+  assert.equal(written.options?.surfaceOp, 'append', '要用表面追加操作，才会立刻进历史')
+  assert.equal(written.message.source.kind, 'self-heal')
+  assert.ok(Object.isFrozen(written.message), '写进会话的消息必须已冻结')
+  // 只说「你复读了」没有用，必须给方向。
+  assert.ok(written.message.content[0].text.includes('复读'), '要点明病类')
+  assert.ok(written.message.content[0].text.includes('不要重复'), '要给可执行的定向指令')
+  assert.equal(agent.steered.length, 0, '这条链路不该用 steer（那要等下一步才进历史）')
+})
+
+test('恢复：诊断写在压缩之后（免得被这次压缩摘要掉）', async () => {
+  const order = []
+  const agent = fakeAgent()
+  const compaction = fakeCompaction({
+    effect: (target) => {
+      order.push('compact')
+      target.touch(1)
+    },
+  })
+  const originalAppend = agent.session.append.bind(agent.session)
+  agent.session.append = (...args) => {
+    order.push('diagnose')
+    return originalAppend(...args)
+  }
+  const app = mount({}, { compaction })
+
+  await app.waterfall('agent/request-error', tripPayload(agent), () => 'terminal')
+  assert.deepEqual(order, ['compact', 'diagnose'], '顺序反了的话，诊断会被压缩顺手摘要掉')
+})
+
+test('恢复：不同熔断给不同的定向指令', async () => {
+  const cases = [
+    [CODES.repeat, '不要重复'],
+    [CODES.timeout, '直接给出结论'],
+  ]
+  for (const [code, needle] of cases) {
+    const agent = fakeAgent()
+    const app = mount({}, { compaction: fakeCompaction({ effect: (t) => t.touch(1) }) })
+    await app.waterfall(
+      'agent/request-error',
+      tripPayload(agent, { failure: { message: 'x', code } }),
+      () => 'terminal',
+    )
+    assert.equal(agent.appended.length, 1, code + ' 应当写一条诊断')
+    assert.ok(agent.appended[0].message.content[0].text.includes(needle), code + ' 的指令不对')
+  }
+})
+
+test('恢复：短路打转的指令要它「立刻动手」，不是再解释一遍', async () => {
+  const agent = fakeAgent()
+  const app = mount({}, { compaction: fakeCompaction({ effect: (t) => t.touch(1) }) })
+  await app.waterfall(
+    'agent/request-error',
+    tripPayload(agent, { failure: { message: '短句打转', code: CODES.loop } }),
+    () => 'terminal',
+  )
+  const text = agent.appended[0].message.content[0].text
+  assert.ok(text.includes('调用工具'), '要指向「去调用工具」这个动作')
+  assert.ok(text.includes('不要再用文字描述'), '要明确禁止继续复述计划')
+})
+
+test('恢复：关掉 explainFailure 后不再写诊断（重发照常）', async () => {
+  const agent = fakeAgent()
+  const app = mount(
+    { recover: { explainFailure: false } },
+    { compaction: fakeCompaction({ effect: (t) => t.touch(1) }) },
+  )
+  const action = await app.waterfall('agent/request-error', tripPayload(agent), () => 'terminal')
+  assert.deepEqual(action, { kind: 'retry' })
+  assert.equal(agent.appended.length, 0)
+})
+
+test('恢复：写诊断失败也不能挡住重发', async () => {
+  const agent = fakeAgent()
+  agent.session.append = () => {
+    throw new Error('surface 拒绝写入')
+  }
+  const app = mount({}, { compaction: fakeCompaction({ effect: (t) => t.touch(1) }) })
+  const action = await app.waterfall('agent/request-error', tripPayload(agent), () => 'terminal')
+  assert.deepEqual(action, { kind: 'retry' }, '诊断是锦上添花，不能拖垮恢复')
+  assert.ok(app.logs.some((entry) => entry.message.includes('写诊断消息失败')))
+})
+
+test('恢复：会话没有 append 能力时静默跳过诊断', async () => {
+  const agent = fakeAgent()
+  delete agent.session.append
+  const app = mount({}, { compaction: fakeCompaction({ effect: (t) => t.touch(1) }) })
+  const action = await app.waterfall('agent/request-error', tripPayload(agent), () => 'terminal')
+  assert.deepEqual(action, { kind: 'retry' })
+})
+
+// ---------------------------------------------------------------------------
 // B. 「只想不说」的补救
 // ---------------------------------------------------------------------------
 
@@ -811,4 +920,131 @@ test('极端：同一次调用的记录会被下一次调用覆盖（不会拿�
 
   await app.emit('agent/turn-stopping', { agent, turn: 1, signal: liveSignal() })
   assert.equal(agent.steered.length, 0, '应当以最近一次调用的结论为准')
+})
+
+// ---------------------------------------------------------------------------
+// D. 工具调用打转：挂在 tools/post-execute 上，靠附加上下文提醒
+//
+//    为什么不用 steer：工具刚跑完，把提醒作为附加上下文交给下一步，
+//    模型的下一次请求就会看到它 —— 与 DSH 自带的 repeat-tool-reminder 同一机制。
+// ---------------------------------------------------------------------------
+
+/**
+ * 依次触发若干次工具执行。
+ * @param {object} app - 挂载结果。
+ * @param {object} agent - 目标 agent。
+ * @param {Array} plan - `[工具名, 参数]` 数组。
+ * @param {object} [downstream] - 下游返回值。
+ * @returns {Promise<object>} 最后一次的返回值。
+ */
+async function runTools(app, agent, plan, downstream = {}) {
+  const listener = app.one('tools/post-execute')
+  let out = downstream
+  for (const [name, args] of plan) {
+    out = await listener({ agent, name, arguments: args }, {}, () => downstream)
+  }
+  return out
+}
+
+/** 造「同样的两工具环走 n 遍」。 */
+function toolCycle(n) {
+  const plan = []
+  for (let i = 0; i < n; i += 1) {
+    plan.push(['read_file', { path: 'src/a.js' }])
+    plan.push(['edit_file', { path: 'src/a.js', from: 'x', to: 'y' }])
+  }
+  return plan
+}
+
+test('工具打转：命中后把提醒挂进附加上下文', async () => {
+  const agent = fakeAgent()
+  const app = mount({})
+  const out = await runTools(app, agent, toolCycle(3))
+
+  assert.ok(Array.isArray(out.additionalContexts), '必须挂上附加上下文')
+  const notice = out.additionalContexts[0]
+  assert.equal(notice.source.kind, 'self-heal')
+  assert.equal(notice.role, 'user')
+  assert.ok(notice.content[0].text.includes('重复同一套动作'), '文案要说明发生了什么')
+  assert.ok(notice.content[0].text.includes('换一个办法'), '文案要给出方向')
+  assert.ok(
+    app.logs.some((entry) => entry.message.includes('工具调用打转')),
+    '应当留一条可排查的日志',
+  )
+})
+
+test('工具打转：不覆盖下游已经放进去的附加上下文', async () => {
+  const agent = fakeAgent()
+  const app = mount({})
+  const existing = { id: 'other-notice', role: 'user', content: [{ type: 'text', text: '别人的提醒' }] }
+  const out = await runTools(app, agent, toolCycle(3), { additionalContexts: [existing] })
+
+  assert.equal(out.additionalContexts.length, 2, '我们的提醒要加进去，不能顶掉别人的')
+  assert.equal(out.additionalContexts[1], existing)
+})
+
+test('工具打转：下游是 block 时保留 feedback', async () => {
+  const agent = fakeAgent()
+  const app = mount({})
+  const out = await runTools(app, agent, toolCycle(3), { kind: 'block', feedback: '被沙箱拦下了' })
+
+  assert.equal(out.kind, 'block')
+  assert.equal(out.feedback, '被沙箱拦下了')
+  assert.ok(Array.isArray(out.additionalContexts) && out.additionalContexts.length === 1)
+})
+
+test('工具打转：参数在变的正常多步任务绝不打扰', async () => {
+  const agent = fakeAgent()
+  const app = mount({})
+  const plan = []
+  for (let i = 0; i < 8; i += 1) {
+    plan.push(['read_file', { path: 'file-' + i + '.js' }])
+    plan.push(['edit_file', { path: 'file-' + i + '.js', line: i }])
+  }
+  const out = await runTools(app, agent, plan)
+  assert.equal(out.additionalContexts, undefined, '在推进就不该被打扰')
+})
+
+test('工具打转：用户插了新话之后，旧账清零', async () => {
+  const agent = fakeAgent()
+  const app = mount({})
+
+  // 先走两遍（不够三遍，还没到提醒线）。
+  await runTools(app, agent, toolCycle(2))
+
+  // 用户说话了 → 这是新的意图，之前的动作序列不该再算数。
+  const preStep = app.one('agent/pre-step')
+  await preStep({ agent, messages: [{ source: { kind: 'user' } }] }, () => undefined)
+
+  // 再走两遍：如果没清零，四遍就该提醒了；清零之后不该。
+  const out = await runTools(app, agent, toolCycle(2))
+  assert.equal(out.additionalContexts, undefined, '新意图之后不该拿旧账判它')
+})
+
+test('工具打转：自己注入的提醒不会被当成用户消息（否则永远清零）', async () => {
+  const agent = fakeAgent()
+  const app = mount({})
+  const notice = { source: { kind: 'self-heal' } }
+  const preStep = app.one('agent/pre-step')
+  await preStep({ agent, messages: [notice] }, () => undefined)
+
+  // 没被清零 → 三遍仍能命中。
+  const out = await runTools(app, agent, toolCycle(3))
+  assert.ok(Array.isArray(out.additionalContexts))
+})
+
+test('工具打转：exec 载荷残缺也不得抛错', async () => {
+  const app = mount({})
+  const listener = app.one('tools/post-execute')
+  await listener({}, {}, () => ({}))
+  await listener(undefined, {}, () => ({}))
+  await listener({ agent: fakeAgent() }, {}, () => ({}))
+  assert.ok(true, '没崩就算过')
+})
+
+test('工具打转：关掉开关后完全不介入', async () => {
+  const agent = fakeAgent()
+  const app = mount({ tools: { enabled: false } })
+  const out = await runTools(app, agent, toolCycle(3))
+  assert.equal(out.additionalContexts, undefined)
 })

@@ -141,6 +141,20 @@ await check('服务入口 agentPresets.serviceFor(agent, name) 仍然存在', ()
   expectInSource('dsh-agent-preset-registry', join('lib', 'types', 'mount.js'), 'export function serviceForAgent', '按 agent 取预设内服务')
 })
 
+await check('事件 tools/post-execute 仍然存在，且派发时以 exec.agent 定作用域', () => {
+  expectInSource('dsh-tools', join('lib', 'index.js'), '"tools/post-execute"', '工具执行后的介入点')
+  expectInSource('dsh-scope', join('lib', 'invariant.js'), '"tools/post-execute"', '官方作用域不变式里也认这个事件')
+})
+
+await check('工具执行的载荷仍带 agent / name / arguments，注入通道仍是 additionalContexts', () => {
+  // 这三个字段名与注入通道，我们都是照着官方 dsh-repeat-tool-reminder 的用法来的；
+  // 官方自己改了字段名，这条检查会跟着失败 —— 这正是我们要的早期报警。
+  expectInSource('dsh-repeat-tool-reminder', join('lib', 'index.js'), 'exec.agent', '按 agent 记状态')
+  expectInSource('dsh-repeat-tool-reminder', join('lib', 'index.js'), 'exec.name', '工具名')
+  expectInSource('dsh-repeat-tool-reminder', join('lib', 'index.js'), 'exec.arguments', '工具参数')
+  expectInSource('dsh-repeat-tool-reminder', join('lib', 'index.js'), 'additionalContexts', '把提醒交给下一步的通道')
+})
+
 await check('压缩服务 compactIfNeeded(agent, trigger, signal) 仍然存在', () => {
   const text = readPackageFile('dsh-compaction', join('lib', 'types', 'index.d.ts'))
   if (text === undefined) throw new Error('读不到 dsh-compaction 的类型定义')

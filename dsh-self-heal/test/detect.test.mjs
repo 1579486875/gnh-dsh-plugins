@@ -17,9 +17,11 @@ import {
   LINE_DEFAULTS,
   REPEAT_DEFAULTS,
   SENTENCE_LOOP_DEFAULTS,
+  TOOL_LOOP_DEFAULTS,
   UNFINISHED_DEFAULTS,
   createRepeatDetector,
   createSentenceLoopDetector,
+  createToolLoopTracker,
   detectInTail,
   detectSentenceLoop,
   detectUnfinished,
@@ -740,7 +742,139 @@ test('短句打转：门槛与确认轮数必须足够保守', () => {
 })
 
 // ---------------------------------------------------------------------------
-// 6. 性能
+// 6. 工具调用打转（动作层）
+//
+//    这一层比文本层更容易误伤：「读文件 → 改文件 → 跑测试」本来就是正常的
+//    干活方式。所以下面「参数不同就必须放过」的用例，比「必须命中」更重要。
+// ---------------------------------------------------------------------------
+
+/**
+ * 把一串 `[工具名, 参数]` 依次喂进追踪器，返回最后一次命中（没有则 null）。
+ * @param {Array} plan - 调用计划。
+ * @param {object} [opts] - 阈值覆盖。
+ * @returns {object|null} 命中描述。
+ */
+function feedTools(plan, opts) {
+  const tracker = createToolLoopTracker(opts)
+  let hit = null
+  for (const [tool, args] of plan) hit = tracker.push({ tool, args }) ?? hit
+  return hit
+}
+
+/** 造「重复 n 遍的两工具环」。 */
+function twoToolCycle(n, path = 'src/a.js') {
+  const plan = []
+  for (let i = 0; i < n; i += 1) {
+    plan.push(['read_file', { path }])
+    plan.push(['edit_file', { path, from: 'x', to: 'y' }])
+  }
+  return plan
+}
+
+test('工具打转：同样的两工具环走三遍 → 提醒', () => {
+  const hit = feedTools(twoToolCycle(3))
+  assert.ok(hit !== null, '同样的工具、几乎同样的参数走了三遍，必须提醒')
+  assert.equal(hit.kind, 'tool-cycle')
+  assert.deepEqual(hit.cycle, ['read_file', 'edit_file'])
+  assert.equal(hit.repeats, 3)
+})
+
+test('工具打转：三工具环（A→B→C）同样能认出来', () => {
+  const plan = []
+  for (let i = 0; i < 3; i += 1) {
+    plan.push(['read_file', { path: 'a.js' }])
+    plan.push(['edit_file', { path: 'a.js', from: 'x', to: 'y' }])
+    plan.push(['bash', { command: 'npm test' }])
+  }
+  const hit = feedTools(plan)
+  assert.ok(hit !== null)
+  assert.deepEqual(hit.cycle, ['read_file', 'edit_file', 'bash'])
+})
+
+test('工具打转：参数每次都不一样 → 绝不提醒（这才是正常干活）', () => {
+  const plan = []
+  for (let i = 0; i < 5; i += 1) {
+    plan.push(['read_file', { path: 'file-' + i + '.js' }])
+    plan.push(['edit_file', { path: 'file-' + i + '.js', line: i * 10, from: 'aaa' + i, to: 'bbb' + i }])
+  }
+  assert.equal(
+    feedTools(plan),
+    null,
+    '「读不同文件、改不同地方」是推进而不是卡住 —— 只看工具名就会在这里误报',
+  )
+})
+
+test('工具打转：参数只差几个斜杠仍算同一件事（手滑不该算推进）', () => {
+  const plan = []
+  // 归一化只合并「连续斜杠」这类明显手滑的差异；对象参数本身会被 JSON.stringify
+  // 规范化，所以这里用字符串参数来检验归一化确实生效。
+  const variants = [{ path: 'src/a.js' }, { path: 'src//a.js' }, { path: 'src///a.js' }]
+  for (let i = 0; i < 3; i += 1) {
+    plan.push(['read_file', variants[i]])
+    plan.push(['bash', { command: 'npm test' }])
+  }
+  assert.ok(feedTools(plan) !== null, '几乎一样的参数反复用，属于打转')
+})
+
+test('工具打转：两个目标严格交替三遍，也算环（同一个工具也一样）', () => {
+  // ⚠️ 这条是**有意的**：`f0 → f1 → f0 → f1 → f0 → f1` 是一个真实的周期模式，
+  // 哪怕工具名一直是 read_file。真正「读不同文件」的长这样：f0 → f1 → f2 → …
+  // （见上一条用例，那种必须放过）。
+  const plan = []
+  for (let i = 0; i < 3; i += 1) {
+    plan.push(['read_file', { path: 'file-0.js' }])
+    plan.push(['read_file', { path: 'file-1.js' }])
+  }
+  const hit = feedTools(plan)
+  assert.ok(hit !== null, '严格交替本身就是周期')
+  assert.equal(hit.cycle.length, 2)
+  assert.equal(hit.repeats, 3)
+})
+
+test('工具打转：只走两遍不提醒（还没到「卡住」的程度）', () => {
+  assert.equal(feedTools(twoToolCycle(2)), null)
+})
+
+test('工具打转：同一个工具用不同参数连续调用不算环', () => {
+  const plan = []
+  for (let i = 0; i < 6; i += 1) plan.push(['read_file', { path: 'f' + i + '.js' }])
+  assert.equal(feedTools(plan), null)
+})
+
+test('工具打转：提醒次数有上限（提醒本身会打断思路）', () => {
+  const tracker = createToolLoopTracker()
+  let count = 0
+  const plan = []
+  for (let i = 0; i < 20; i += 1) plan.push(...twoToolCycle(1))
+  for (const [tool, args] of plan) if (tracker.push({ tool, args }) !== null) count += 1
+  assert.equal(count, TOOL_LOOP_DEFAULTS.maxReminders, '最多提醒 maxReminders 次')
+})
+
+test('工具打转：关掉开关后完全不判', () => {
+  assert.equal(feedTools(twoToolCycle(3), { enabled: false }), null)
+})
+
+test('工具打转：没有工具名的调用不参与判定', () => {
+  const tracker = createToolLoopTracker()
+  assert.equal(tracker.push({ args: { a: 1 } }), null)
+  assert.equal(tracker.push({}), null)
+  assert.equal(tracker.push(null), null)
+  assert.equal(tracker.size(), 0, '无名调用不该占窗口')
+})
+
+test('工具打转：reset 之后重新开始', () => {
+  const tracker = createToolLoopTracker()
+  for (const [tool, args] of twoToolCycle(3)) tracker.push({ tool, args })
+  tracker.reset()
+  assert.equal(tracker.size(), 0)
+  // 重置后再走两遍（不够三遍）不该提醒。
+  let hit = null
+  for (const [tool, args] of twoToolCycle(2)) hit = tracker.push({ tool, args }) ?? hit
+  assert.equal(hit, null)
+})
+
+// ---------------------------------------------------------------------------
+// 7. 性能
 // ---------------------------------------------------------------------------
 
 test('性能：10 万次小分片 push 必须很快（每个 token 级分片都会调它）', () => {

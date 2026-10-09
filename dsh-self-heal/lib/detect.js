@@ -848,3 +848,183 @@ export function createSentenceLoopDetector(opts) {
     },
   }
 }
+
+/* ══════════════════════════════════════════════════════════════════════════
+ *  第四部分：工具调用打转识别 ——「同一套动作反复走」
+ *
+ *  前三部分看的都是**模型输出的文本**。这一部分看的是**它的动作**：
+ *  它调了哪些工具、参数是什么。
+ *
+ *  ⚠️ 为什么这一层要格外小心：
+ *  「读文件 → 改文件 → 跑测试」这种循环**本来就是正常干活的方式**。
+ *  只看「工具序列出现了 A→B→C→A」就报警，会把大量正常工作判成卡住。
+ *
+ *  所以这里的判据加了一条**去误报的关键**：不只是动作序列要重复，
+ *  **参数也必须高度相似**。正常的「读 A → 改 B → 测 C」每次参数都不同，
+ *  会被这一条挡住；而「一直用同样的参数干同样的事」才真的叫卡住。
+ *
+ *  与 DSH 自带的 `dsh-repeat-tool-reminder` 的分工：它管「同一个工具、完全
+ *  相同的参数连续调用 N 次」，这里管**它覆盖不到的两种**：
+ *    · 多工具形成的**环**（A→B→C→A→B→C）；
+ *    · 参数**近似但不完全相同**的重复（例如只是路径斜杠或空格变了）。
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * 「工具调用打转」检测的默认参数。
+ *
+ * 取向依然是**宁可漏判**：在动作层误报的代价比文本层还高 —— 提醒一次会让模型
+ * 丢掉正在推进的思路。所以这里要求「环重复 3 遍」且「参数高度相似」才开口。
+ */
+export const TOOL_LOOP_DEFAULTS = Object.freeze({
+  enabled: true,
+  /** 记住最近多少次工具调用。 */
+  windowSize: 12,
+  /** 环的最短长度（2 = A→B→A→B）。 */
+  minCycle: 2,
+  /** 环的最长长度。 */
+  maxCycle: 3,
+  /** 同一个环至少重复几遍才算卡住（3 遍 × 环长 2~3 = 6~9 次调用）。 */
+  minCycles: 3,
+  /**
+   * 参数比对前要不要做「同一个意思」的归一化。
+   *
+   * 打开时，参数里的多余空白与连续斜杠会先被合并 —— 于是 `src//a.js` 与
+   * `src/a.js`、`npm  test` 与 `npm test` 算同一个动作（这种差异只是手滑）。
+   *
+   * ⚠️ 但**只有归一化后完全一致才算同一个动作**，不做任何「相似度」放宽：
+   * 因为字符串相似度根本分不清「换了目标」和「手滑多打一个字符」 ——
+   * 实测 `file-0.js` 与 `file-1.js` 的二元组相似度高达 0.84，按相似度判会把
+   * 「读不同文件」这种**正常推进**误报成卡住。宁可放过，也不要误伤。
+   */
+  canonicalize: true,
+  /** 同一个 agent 最多提醒几次（提醒是打断思路的，不能反复来）。 */
+  maxReminders: 2,
+})
+
+/**
+ * 把一个值转成可比较的字符串。
+ * @param {unknown} args - 工具参数（对象 / 字符串 / 空）。
+ * @returns {string} 规范化后的字符串。
+ */
+function argsToText(args) {
+  if (args === undefined || args === null) return ''
+  if (typeof args === 'string') return args
+  try {
+    return JSON.stringify(args)
+  } catch {
+    // 循环引用之类的怪东西：退化成粗略表示，绝不抛错。
+    return String(args)
+  }
+}
+
+/**
+ * 把一段参数文本归一化成「同一个意思」的形式。
+ *
+ * 只做**安全的**归一化：合并连续空白、合并连续斜杠、去掉首尾空白。
+ * 「安全」的意思是：这些差异在工具参数里几乎总是手滑造成的，改了不影响语义。
+ *
+ * ⚠️ 刻意**不做**的事：不去数字、不模糊匹配、不比较相似度。因为
+ * `file-0.js` 与 `file-1.js` 只差一个字符，但目标完全不同 —— 任何相似度
+ * 阈值都会把这种「正常推进」误判成重复（实测二元组相似度高达 0.84）。
+ *
+ * @param {string} text - 原始参数文本。
+ * @returns {string} 归一化后的文本。
+ */
+function canonicalArgs(text) {
+  return text.replace(/\s+/g, ' ').replace(/\/{2,}/g, '/').trim()
+}
+
+/**
+ * 在最近若干次调用里找一个「环」，且环内每次的参数都是同一件事。
+ *
+ * @param {object[]} recent - 最近的调用（`{ name, args }`，args 已归一化）。
+ * @param {object} cfg - 见 {@link TOOL_LOOP_DEFAULTS}。
+ * @returns {{cycle: string[], repeats: number}|null} 命中描述。
+ */
+function findToolCycle(recent, cfg) {
+  for (let period = cfg.minCycle; period <= cfg.maxCycle; period += 1) {
+    const needed = period * cfg.minCycles
+    if (recent.length < needed) continue
+    const tail = recent.slice(-needed)
+
+    // ① 工具名按周期严格重复。
+    let namesMatch = true
+    for (let i = period; i < needed; i += 1) {
+      if (tail[i].name !== tail[i - period].name) {
+        namesMatch = false
+        break
+      }
+    }
+    if (!namesMatch) continue
+
+    // ② 对应位置的参数也必须**完全一致**（归一化之后）。
+    //    这一条是去误报的关键：参数在变，说明它在推进，不是在打转。
+    let argsMatch = true
+    for (let i = period; i < needed; i += 1) {
+      if (tail[i].args !== tail[i - period].args) {
+        argsMatch = false
+        break
+      }
+    }
+    if (!argsMatch) continue
+
+    return {
+      cycle: tail.slice(0, period).map((call) => call.name),
+      repeats: cfg.minCycles,
+    }
+  }
+  return null
+}
+
+/**
+ * 创建一个「工具调用打转」追踪器（每个 agent 一个实例）。
+ *
+ * 用法：每次工具执行完 `push({ tool, args })`，返回非 null 说明该提醒了。
+ *
+ * @param {object} [opts] - 见 {@link TOOL_LOOP_DEFAULTS}。
+ * @returns {{push: (call: object) => object|null, reset: () => void, size: () => number}} 追踪器。
+ */
+export function createToolLoopTracker(opts = {}) {
+  const cfg = { ...TOOL_LOOP_DEFAULTS, ...opts }
+  /** 最近若干次调用的指纹（按时间顺序）。 */
+  const recent = []
+  let reminders = 0
+
+  return {
+    /**
+     * 记一次工具调用。
+     * @param {object} call - `{ tool, args }`。
+     * @returns {{kind: string, cycle: string[], repeats: number}|null}
+     *   命中时返回描述（`kind` 固定为 `tool-cycle`）；否则 null。
+     */
+    push(call) {
+      if (cfg.enabled !== true) return null
+      const tool = typeof call?.tool === 'string' ? call.tool : ''
+      // 没名字的调用不参与判定（也不重置 —— 它可能只是我们不认识的工具）。
+      if (tool === '') return null
+
+      const raw = argsToText(call?.args)
+      recent.push({ name: tool, args: cfg.canonicalize === true ? canonicalArgs(raw) : raw })
+      if (recent.length > cfg.windowSize) recent.shift()
+
+      // 提醒次数用满后就不再开口，但仍然继续记录（万一以后想看历史）。
+      if (reminders >= cfg.maxReminders) return null
+
+      const hit = findToolCycle(recent, cfg)
+      if (hit === null) return null
+      reminders += 1
+      return { kind: 'tool-cycle', ...hit }
+    },
+
+    /** 清空状态（换一轮对话时用）。 */
+    reset() {
+      recent.length = 0
+      reminders = 0
+    },
+
+    /** @returns {number} 已记录多少次调用。 */
+    size() {
+      return recent.length
+    },
+  }
+}
