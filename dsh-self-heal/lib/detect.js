@@ -435,6 +435,19 @@ export const UNFINISHED_DEFAULTS = Object.freeze({
   tailChars: 4096,
   /** 是否启用第 ④ 条（文末自我承诺句式）。它误报率最高，可以单独关掉。 */
   detectPromises: true,
+  /**
+   * 缓冲区大小：插件实际保留的正文尾巴比 {@link UNFINISHED_DEFAULTS.tailChars}
+   * 更长的原因见第 ② 条判据 —— 代码围栏必须从「确定位于代码块之外」的位置
+   * 开始配对，只看判定窗口会把闭围栏误当成开围栏。
+   */
+  bufferChars: 16384,
+  /**
+   * 传入的 `tailText` 是否已经被截断（前面还有没传进来的内容）。
+   *
+   * 默认 `false`：调用方传的就是全文。脱离 DSH 直接调用本函数时（写测试、
+   * 做诊断）都该用默认值。
+   */
+  bufferTruncated: false,
 })
 
 /**
@@ -529,8 +542,11 @@ function lastSentence(text) {
  * @param {string|undefined} finishKind - 这次流是怎么结束的。取值来自流末尾
  *   那个 `finish` 分片的 `reason.kind`：`'stop'` 表示模型自己说完了；
  *   `'max-tokens'` 表示被长度上限截断；`'aborted'` / `'error'` 表示被打断或出错。
- * @param {string} tailText - **正文**的尾部文本（不含思考内容）。
- * @param {object} [opts] - 见 {@link UNFINISHED_DEFAULTS}。
+ * @param {string} tailText - **正文**的尾部文本（不含思考内容）。它应当比
+ *   `opts.tailChars` 更长（插件里是 `bufferChars` 那么长的缓冲），因为围栏配对
+ *   需要看到判定窗口之外的内容；传全文最准。
+ * @param {object} [opts] - 见 {@link UNFINISHED_DEFAULTS}。其中 `bufferTruncated`
+ *   必须如实反映「`tailText` 前面是否还有没传进来的内容」。
  * @returns {{reason: string, detail: string}|null} 命中时返回原因（reason 是给
  *   日志用的短标签，detail 是给人看的一句话说明）；判定为「说完了」时返回 null。
  */
@@ -556,11 +572,22 @@ export function detectUnfinished(finishKind, tailText, opts = {}) {
 
   // ── 依据 ②：代码围栏没闭合 ──────────────────────────────────────────────
   // 用奇数判断：完整的一对围栏是两个，多出一个就说明有一个还没关上。
-  // 一个都没有时**不报**：这时可能是「本来就没有代码块」，也可能是「开围栏
-  // 发生在窗口之外」——两种情况都无法据此下结论，宁可漏判。
-  const fences = countFences(tail)
-  if (fences > 0 && fences % 2 === 1) {
-    return { reason: 'open-code-fence', detail: '代码块没有写完（有未闭合的 ``` 围栏）' }
+  //
+  // ⚠️ 数围栏必须**从确定位于代码块之外的位置**开始，否则会把闭围栏当成开围栏。
+  // 真实事故（2026-10-11）：判定窗口取的是最后 4096 字符，而窗口起点落在一个
+  // 代码块**内部**时，窗口里那个 ``` 其实是**闭围栏**；只数窗口内奇偶就会把
+  // 一份闭合的完整报告判成「没写完」。实测同一条会话里连错 4 次，四次的全文
+  // 围栏数都是偶数（2 / 14 / 4 / 8 个），全是窗口劈开代码块导致的。
+  //
+  // 所以：
+  //   · 缓冲区**没**被截断 → 它的开头就是这次输出的开头（必在代码块之外）→ 数全部；
+  //   · 缓冲区**被**截断   → 开头状态未知 → **放弃这条判据**（宁可漏判，绝不打错）。
+  //     一个都没有时同样不报：可能是「本来就没有代码块」。
+  if (cfg.bufferTruncated !== true) {
+    const fences = countFences(tailText.replace(/\s+$/, ''))
+    if (fences > 0 && fences % 2 === 1) {
+      return { reason: 'open-code-fence', detail: '代码块没有写完（有未闭合的 ``` 围栏）' }
+    }
   }
 
   // ── 依据 ③：停在一个悬空标点上 ──────────────────────────────────────────

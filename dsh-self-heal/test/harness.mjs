@@ -156,6 +156,61 @@ export function textDeltas(text, size) {
 }
 
 /**
+ * 生成一批**互不相同**的代码行，用来把正文撑过判定窗口。
+ *
+ * ⚠️ 每行必须不同。若图省事写成 `'const a = 1\n'.repeat(400)`，在**链路测试**里
+ * 会先被复读检测熔断（那是另一条链路，而被熔断的调用根本不记账），于是围栏判据
+ * 压根轮不到执行 —— 测试会因为「没提醒」而**假通过**。
+ *
+ * @param {number} count - 行数。
+ * @returns {string} 代码文本。
+ */
+export function variedCodeLines(count) {
+  let out = ''
+  for (let i = 0; i < count; i += 1) {
+    out += 'const v' + String(i) + ' = ' + String(i * 7 + 3) + '; // 第 ' + String(i) + ' 行\n'
+  }
+  return out
+}
+
+/**
+ * 造一份「判定窗口正好把一对代码围栏劈开」的完整报告。
+ *
+ * 现场还原（2026-10-11 真实事故）：一份 5 千多字符的完整报告，中间有若干代码块，
+ * 末尾正常收尾，却被判成「代码块没有写完」。根因是判定窗口（最后 4096 字符）的
+ * 起点落在**某对围栏内部** —— 窗口里那个 ``` 其实是**闭围栏**，只数窗口内奇偶
+ * 就会读成「开围栏没关」。同一条会话里连错 4 次，四次的全文围栏数都是偶数
+ * （2 / 14 / 4 / 8 个），全是窗口劈开代码块所致。
+ *
+ * @returns {string} 一份闭合的、但窗口内围栏数为奇数的报告。
+ */
+export function fenceStraddlingReport() {
+  return (
+    '先给结论。\n\n```js\n' + // 开围栏在位置 7 —— 必须落在判定窗口之外
+    variedCodeLines(400) + // 足够长：把窗口起点推到闭围栏之前
+    '\n```\n\n' + // 闭围栏落在判定窗口之内
+    '以上是全部改动，测试都通过了。'
+  )
+}
+
+/**
+ * 造一份「多代码块的长报告」—— 真实助手回复最常见的形态。
+ *
+ * 它也刻意超过判定窗口（最后 4096 字符），因此和 {@link fenceStraddlingReport}
+ * 一样是一道回归防线：窗口劈开代码块的 bug 一旦回来，这份样本会被误判。
+ *
+ * @returns {string} 一份闭合的、含 6 个代码块的长报告。
+ */
+export function multiBlockReport() {
+  let text = '# 结论\n\n先说结论：改动很小，但边界条件补齐了。\n\n'
+  for (let i = 1; i <= 6; i += 1) {
+    text += '## 第 ' + i + ' 节\n\n这一节说明改动的内容与理由，以及它为什么不会影响其它路径。\n\n'
+    text += '```js\n' + variedCodeLines(80) + '```\n\n'
+  }
+  return text + '以上是全部改动，测试都通过了。'
+}
+
+/**
  * 造一个假 agent（只保留插件会用到的字段）。
  *
  * @param {object} [opts] - `{ id, replace, content }`；replace/content 用来模拟压缩后的代数变化。

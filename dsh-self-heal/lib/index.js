@@ -177,6 +177,17 @@ export const DEFAULT_CONFIG = Object.freeze({
     /** 判定用的尾部窗口（字符）；与检测内核的默认值保持同源，避免两处脱节。 */
     tailChars: UNFINISHED_DEFAULTS.tailChars,
     /**
+     * 正文缓冲的大小（字符），必须 **大于** 判定窗口。
+     *
+     * 为什么不能直接用判定窗口：判定「代码块有没有闭合」要数 ``` 的奇偶，而
+     * 数奇偶的前提是「从代码块之外开始数」。缓冲等于窗口时，窗口起点可能落在
+     * 某个代码块内部，那个 ``` 其实是**闭围栏**，一数就把闭合的文档判成没写完
+     * （真实事故：同一条会话连错 4 次）。
+     *
+     * 缓冲越长，能精确判定的正文越长；代价只是每轮多留几 KB 字符串。
+     */
+    bufferChars: UNFINISHED_DEFAULTS.bufferChars,
+    /**
      * 提醒正文；会在会话里以一条 user 消息的形式出现。
      *
      * 文案刻意只说「怎么做」，不说「你被哪条规则判定为没写完」——后者是给
@@ -494,6 +505,8 @@ export function createTailBuffer(limitChars) {
   let pieces = []
   /** 自上次合并以来新攒了多少个字符，用来决定什么时候值得合并一次。 */
   let pending = 0
+  /** 累计被截掉的字符数。>0 意味着缓冲里已经不是「从头开始」的文本。 */
+  let dropped = 0
 
   /**
    * 把数组里的片段合并成一段，只保留尾巴，并重置计数。
@@ -505,7 +518,10 @@ export function createTailBuffer(limitChars) {
     // 只有一段、而且没超过窗口：无需任何复制，直接用。
     if (pieces.length === 1 && pieces[0].length <= limit) return pieces[0]
     let joined = pieces.length === 1 ? pieces[0] : pieces.join('')
-    if (joined.length > limit) joined = joined.slice(-limit)
+    if (joined.length > limit) {
+      dropped += joined.length - limit
+      joined = joined.slice(-limit)
+    }
     pieces = [joined]
     return joined
   }
@@ -540,6 +556,21 @@ export function createTailBuffer(limitChars) {
       let total = 0
       for (const piece of pieces) total += piece.length
       return total
+    },
+
+    /**
+     * 累计被丢掉了多少个字符（缓冲装不下、从头截掉的量）。
+     *
+     * 用途只有一个但很关键：判定「代码块有没有闭合」必须从**确定位于代码块
+     * 之外**的位置开始数围栏。返回值大于 0 就说明缓冲里已经不是从头开始的
+     * 文本，那个前提不成立 —— 这时宁可漏判，也不能把闭围栏当成开围栏
+     * （真实事故：窗口起点落在代码块内部，一份闭合的完整报告被判成「没写完」，
+     * 同一条会话里连错 4 次）。
+     *
+     * @returns {number} 被丢弃的字符数；从未丢弃过则为 0。
+     */
+    droppedChars() {
+      return dropped
     },
   }
 }
@@ -625,7 +656,7 @@ async function* healStream(ctx, cfg, runtime, options, source) {
    * 不算「没说完」。补救功能关掉时连缓冲都不建，一分钱开销都不花。
    */
   const collectTail = cfg.unfinished.enabled === true
-  const tailBuffer = collectTail ? createTailBuffer(cfg.unfinished.tailChars) : null
+  const tailBuffer = collectTail ? createTailBuffer(bufferCharsOf(cfg)) : null
 
   /** 这次流是怎么结束的（`stop` / `max-tokens` / `error` …），取自末尾的 finish 分片。 */
   let finishKind
@@ -734,6 +765,8 @@ async function* healStream(ctx, cfg, runtime, options, source) {
         // 下面两项供「说了一半就停」的判定使用（一轮结束时才读）。
         finishKind,
         tailText: tailBuffer === null ? '' : tailBuffer.text(),
+        // 缓冲装不下时前面已被丢弃 —— 围栏配对的前提（从头数起）不成立，如实标记。
+        bufferTruncated: tailBuffer !== null && tailBuffer.droppedChars() > 0,
       })
       // 这次调用正常走完了 —— 如果它是一次熔断之后的「重发」，那一次自愈就算成功。
       settleRecovery(ctx, cfg, runtime, sessionId)
@@ -1105,6 +1138,24 @@ function installRunawayRecovery(ctx, cfg, runtime) {
 }
 
 /**
+ * 算出正文缓冲该留多长。
+ *
+ * 两个约束：① 不短于判定窗口 —— 否则窗口取不满，悬空标点与承诺句式两条判据
+ * 会退化；② 尽量长 —— 围栏配对要从代码块之外数起（见配置里 `bufferChars`
+ * 的说明）。用户把两个值配反了也不会出问题，这里取较大者兜住。
+ *
+ * @param {object} cfg - 生效配置。
+ * @returns {number} 缓冲字符数。
+ */
+export function bufferCharsOf(cfg) {
+  const pick = (value, fallback) =>
+    typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback
+  const window = pick(cfg?.unfinished?.tailChars, UNFINISHED_DEFAULTS.tailChars)
+  const want = pick(cfg?.unfinished?.bufferChars, UNFINISHED_DEFAULTS.bufferChars)
+  return Math.max(want, window)
+}
+
+/**
  * 判断「这一次调用算不算没说完」。返回 null 表示正常收尾，不用管。
  *
  * 顺序很重要，从「明确」排到「含糊」：
@@ -1131,6 +1182,8 @@ function unfinishedOf(info, cfg) {
   const hit = detectUnfinished(info.finishKind, info.tailText, {
     tailChars: cfg.unfinished.tailChars,
     detectPromises: cfg.unfinished.promises,
+    // 缓冲被截断时「开头在不在代码块里」就无从得知，围栏判据必须让位。
+    bufferTruncated: info.bufferTruncated === true,
   })
   if (hit === null) return null
   return { kind: hit.reason, detail: hit.detail }

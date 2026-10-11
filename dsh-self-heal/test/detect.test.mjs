@@ -29,6 +29,7 @@ import {
   findRepeatingPeriod,
   significantLines,
 } from '../lib/detect.js'
+import { fenceStraddlingReport } from './harness.mjs'
 
 /** 用真实的默认参数对一段文本做一次判定（等价于流末尾的那次检查）。 */
 function judge(text) {
@@ -442,13 +443,53 @@ test('未完成：promises 关掉后，只有「自我承诺」这一条失效�
   assert.equal(detectUnfinished('max-tokens', '', opts).reason, 'max-tokens')
 })
 
-test('未完成：只看尾部窗口，前面写得再长也不影响判定', () => {
+test('未完成：标点与承诺句式只看尾部窗口，前面写得再长也不影响判定', () => {
   const long = variedProse(4000) // 远大于默认窗口
   assert.ok(long.length > UNFINISHED_DEFAULTS.tailChars, '样本必须超过窗口，否则测不到裁剪')
   // 正常收尾的长回答：哪怕正文有几十万字，也不该被判为没写完。
   assert.equal(detectUnfinished('stop', long + '以上，改动完成。'), null)
   // 半截收尾：窗口裁过之后，尾巴上的逗号仍然要能认出来。
   assert.equal(detectUnfinished('stop', long + '接下来还需要，').reason, 'dangling-punctuation')
+  // 注意：**围栏判据不看窗口**，它必须从代码块之外数起 —— 见下面那组回归用例。
+})
+
+/** 数一段文本里 ``` 出现的次数（测试自己的小工具，不依赖被测代码）。 */
+function fencesIn(text) {
+  let count = 0
+  let at = text.indexOf('```')
+  while (at !== -1) {
+    count += 1
+    at = text.indexOf('```', at + 3)
+  }
+  return count
+}
+
+// 「窗口劈开代码块」的现场样本与链路测试共用一份（见 harness.mjs 的
+// fenceStraddlingReport），避免测试与诊断脚本各写一份、慢慢跑偏。
+
+test('未完成：★ 窗口劈开代码块时，闭合的报告绝不能被判成「没写完」（真实事故回归）', () => {
+  const text = fenceStraddlingReport()
+  assert.ok(text.length > UNFINISHED_DEFAULTS.tailChars, '样本必须超过判定窗口')
+  assert.equal(fencesIn(text) % 2, 0, '样本全文必须是闭合的（偶数个围栏）')
+
+  const window = text.slice(-UNFINISHED_DEFAULTS.tailChars)
+  assert.equal(fencesIn(window) % 2, 1, '样本必须真的把一对围栏劈开，否则测不到这个 bug')
+
+  assert.equal(detectUnfinished('stop', text), null, '闭合的完整报告不得被判为没写完')
+})
+
+test('未完成：真未闭合的代码块仍然要认（修完窗口劈开，别把功能修没了）', () => {
+  const text = '下面给出改法。\n\n```js\n' + 'const a = 1\n'.repeat(400)
+  assert.equal(fencesIn(text), 1, '样本只有一个围栏 —— 确实是开围栏没关')
+  assert.equal(detectUnfinished('stop', text).reason, 'open-code-fence')
+})
+
+test('未完成：缓冲被截断时，围栏判据让位（开头在不在代码块里无从得知）', () => {
+  const text = '下面给出改法。\n\n```js\n' + 'const a = 1\n'.repeat(400)
+  // 缓冲装不下、前面已被丢弃时，「从代码块之外数起」这个前提不成立 —— 宁可漏判。
+  assert.equal(detectUnfinished('stop', text, { bufferTruncated: true }), null)
+  // 同一段文本，只要缓冲完整（= 有全文），就照常命中。
+  assert.equal(detectUnfinished('stop', text).reason, 'open-code-fence')
 })
 
 test('未完成：超长的「承诺句」不参与判定（避免偶然用词误报）', () => {
@@ -464,6 +505,11 @@ test('未完成：超长的「承诺句」不参与判定（避免偶然用词�
 test('参数自洽：未完成识别的默认参数合理', () => {
   assert.ok(UNFINISHED_DEFAULTS.tailChars >= 1024, '窗口太小会看不到尾巴')
   assert.equal(UNFINISHED_DEFAULTS.detectPromises, true)
+  assert.ok(
+    UNFINISHED_DEFAULTS.bufferChars > UNFINISHED_DEFAULTS.tailChars,
+    '缓冲必须比判定窗口长，否则围栏配对又会从窗口中间数起（真实事故的根因）',
+  )
+  assert.equal(UNFINISHED_DEFAULTS.bufferTruncated, false, '默认按「传进来的就是全文」处理')
 })
 
 // ---------------------------------------------------------------------------

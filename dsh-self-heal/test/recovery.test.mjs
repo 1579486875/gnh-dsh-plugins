@@ -20,7 +20,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 
 import { CODES } from '../lib/index.js'
-import { drain, fakeAgent, fakeCompaction, liveSignal, mount, streamOf, textDeltas } from './harness.mjs'
+import { drain, fakeAgent, fakeCompaction, fenceStraddlingReport, liveSignal, mount, streamOf, textDeltas, variedCodeLines } from './harness.mjs'
 
 /**
  * 造一段「严格复读、但不会被短句打转那条线抢先」的样本。
@@ -905,6 +905,28 @@ test('未完成：正常收尾的回复绝不打扰（本功能最需要盯的�
     await app.emit('agent/turn-stopping', { agent, turn: 1, signal: liveSignal() })
   }
   assert.equal(agent.steered.length, 0, '正常收尾不得被追着让模型继续说')
+})
+
+test('未完成：★ 长报告被判定窗口劈开代码块时，绝不误报（真实事故回归）', async () => {
+  // 现场（2026-10-11）：一份 5 千多字符的完整报告，中间有若干代码块，末尾正常收尾，
+  // 却被判成「代码块没有写完」，白插一条提醒、还白压了一次上下文 —— 同一条会话连错 4 次。
+  // 根因是判定窗口的起点落在某对围栏**内部**，窗口里那个 ``` 其实是闭围栏。
+  const { agent, app } = orderedEnv({}, 'none')
+  await recordHalfDone(app, agent, fenceStraddlingReport())
+  await app.emit('agent/turn-stopping', { agent, turn: 1, signal: liveSignal() })
+  assert.equal(agent.steered.length, 0, '一份闭合的完整报告不得被追着让模型继续说')
+})
+
+test('未完成：真未闭合的代码块在链路里仍然要提醒（修误报别把功能修没了）', async () => {
+  const { agent, app } = orderedEnv({}, 'none')
+  // 唯一的开围栏落在判定窗口之外 —— 旧逻辑只数窗口会漏掉它，新逻辑数整个缓冲才认得出。
+  await recordHalfDone(app, agent, '下面给出改法。\n\n```js\n' + variedCodeLines(400))
+  await app.emit('agent/turn-stopping', { agent, turn: 1, signal: liveSignal() })
+  assert.equal(agent.steered.length, 1, '真的没写完还是要催')
+  assert.ok(
+    app.logs.some((entry) => entry.message.includes('代码块没有写完')),
+    '日志里要能看出是围栏这条判据',
+  )
 })
 
 test('未完成：truncated=false 时不管「说了半截」，但「一个字没说」照管', async () => {

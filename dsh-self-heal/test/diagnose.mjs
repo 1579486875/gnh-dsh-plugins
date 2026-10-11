@@ -19,6 +19,7 @@ import {
   detectUnfinished,
 } from '../lib/detect.js'
 import { createTailBuffer } from '../lib/index.js'
+import { fenceStraddlingReport, variedCodeLines } from './harness.mjs'
 
 /** 复现群友事故里的真实推理循环文本（15 行，逐字取自截图）。 */
 const REAL_LOOP_BODY = [
@@ -181,9 +182,10 @@ console.log('')
  * @param {string} label - 场景名。
  * @param {string} finishKind - 流的结束方式。
  * @param {string} text - 正文尾部。
+ * @param {object} [opts] - 额外判定参数（如 `bufferTruncated`）。
  */
-function unfinishedCase(label, finishKind, text) {
-  const hit = detectUnfinished(finishKind, text)
+function unfinishedCase(label, finishKind, text, opts) {
+  const hit = detectUnfinished(finishKind, text, opts)
   const verdict = hit === null ? '不管（视为正常收尾）' : '接上（' + hit.reason + '）'
   console.log('  ' + label.padEnd(24) + verdict)
 }
@@ -197,6 +199,9 @@ unfinishedCase('英文 Let me …', 'stop', 'Let me run the tests.')
 console.log('  ' + '-'.repeat(46))
 unfinishedCase('句号正常收尾', 'stop', '以上就是全部改动，测试都通过了。')
 unfinishedCase('完整代码块收尾', 'stop', '```js\nlet a = 1\n```\n')
+unfinishedCase('长报告·窗口劈开代码块', 'stop', fenceStraddlingReport())
+unfinishedCase('长报告·真没闭合', 'stop', '改法如下：\n```js\n' + variedCodeLines(400))
+unfinishedCase('长报告·缓冲被截断', 'stop', '改法如下：\n```js\n' + variedCodeLines(400), { bufferTruncated: true })
 unfinishedCase('表格收尾', 'stop', '| 项目 | 结果 |\n| --- | --- |\n| A | 通过 |\n')
 unfinishedCase('对用户交代下一步', 'stop', '你可以先确认一下配置。')
 unfinishedCase('省略号收尾', 'stop', '大概就是这样吧…')
@@ -208,21 +213,26 @@ console.log('五、尾部缓冲的开销（每个 token 级分片都要过一遍
 console.log('='.repeat(78))
 
 bench('尾部缓冲（8 字符）× 5 万次', () => {
-  const buffer = createTailBuffer(UNFINISHED_DEFAULTS.tailChars)
+  const buffer = createTailBuffer(UNFINISHED_DEFAULTS.bufferChars)
   for (let i = 0; i < small.length; i += 8) buffer.push(small.slice(i, i + 8))
 }, small.length)
 
 bench('对照：旧写法 (tail+text).slice(-N)', () => {
   let tail = ''
   for (let i = 0; i < small.length; i += 8) {
-    tail = (tail + small.slice(i, i + 8)).slice(-UNFINISHED_DEFAULTS.tailChars)
+    tail = (tail + small.slice(i, i + 8)).slice(-UNFINISHED_DEFAULTS.bufferChars)
   }
 }, small.length)
 
 console.log('')
-console.log('说明：尾部缓冲最多占用约 2 个窗口（' + UNFINISHED_DEFAULTS.tailChars + ' 字符 × 2）的内存，')
-console.log('      只有「攒够一个窗口」或「真要读尾巴」时才做一次合并 —— 这就是它比')
+console.log('说明：尾部缓冲最多占用约 2 个缓冲（' + UNFINISHED_DEFAULTS.bufferChars + ' 字符 × 2）的内存，')
+console.log('      只有「攒够一个缓冲」或「真要读尾巴」时才做一次合并 —— 这就是它比')
 console.log('      每片都拼接截断快得多的原因。')
+console.log('')
+console.log('      缓冲（' + UNFINISHED_DEFAULTS.bufferChars + '）刻意比判定窗口（' +
+  UNFINISHED_DEFAULTS.tailChars + '）长 4 倍：')
+console.log('      数 ``` 的奇偶必须从「确定在代码块之外」的位置开始，缓冲等于窗口时')
+console.log('      窗口起点会落在代码块内部，把闭围栏当成开围栏（真实事故，同一条会话连错 4 次）。')
 
 console.log('')
 console.log('='.repeat(78))

@@ -17,7 +17,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 
-import { CODES, DEFAULT_CONFIG, DIAGNOSIS_MESSAGES, createNoticeMessage, resolveConfig } from '../lib/index.js'
+import { CODES, DEFAULT_CONFIG, DIAGNOSIS_MESSAGES, bufferCharsOf, createNoticeMessage, createTailBuffer, resolveConfig } from '../lib/index.js'
 import { drain, mount, streamOf, textDeltas } from './harness.mjs'
 
 const OPTIONS = { provider: 'deepseek-official', model: 'deepseek-v4-flash', sessionId: 'session-1' }
@@ -417,6 +417,37 @@ test('配置：unfinished 组的开关与类型校验', () => {
   assert.equal(cfg.unfinished.promises, false)
   assert.equal(cfg.unfinished.tailChars, 2048)
   assert.equal(cfg.unfinished.silent, DEFAULT_CONFIG.unfinished.silent, '类型不对的值必须退回默认，而不是变成真值')
+})
+
+test('配置：正文缓冲必须比判定窗口长（用户配反了由运行时兜住）', () => {
+  const cfg = resolveConfig({ unfinished: { tailChars: 8192, bufferChars: 1024 } })
+  assert.equal(cfg.unfinished.tailChars, 8192)
+  assert.equal(cfg.unfinished.bufferChars, 1024, '配置项如实保留用户给的值')
+  // 缓冲短于窗口 → 窗口取不满、标点与承诺判据会退化；运行时取较大者兜住。
+  assert.equal(bufferCharsOf(cfg), 8192)
+  assert.equal(bufferCharsOf(resolveConfig({})), DEFAULT_CONFIG.unfinished.bufferChars, '没配时用默认缓冲')
+  assert.ok(
+    DEFAULT_CONFIG.unfinished.bufferChars > DEFAULT_CONFIG.unfinished.tailChars,
+    '默认缓冲必须大于默认窗口',
+  )
+})
+
+test('尾部缓冲：如实报告被丢掉了多少字符（围栏配对的前提）', () => {
+  const buffer = createTailBuffer(100)
+  buffer.push('a'.repeat(60))
+  assert.equal(buffer.droppedChars(), 0, '还没装满，一个字都没丢')
+
+  buffer.push('b'.repeat(60)) // 攒够一个窗口 → 合并并截到 100，丢掉 20
+  assert.equal(buffer.droppedChars(), 20)
+  assert.equal(buffer.text().length, 100)
+
+  buffer.push('c'.repeat(30)) // 再次合并又丢 30
+  assert.equal(buffer.text().length, 100)
+  assert.equal(buffer.droppedChars(), 50, '丢弃量要累计，不能只报最后一次')
+
+  // 再读一次不能重复计数 —— 否则判据会被“越读越截断”。
+  buffer.text()
+  assert.equal(buffer.droppedChars(), 50)
 })
 
 test('配置：每个熔断 code 都必须配一条诊断文案', () => {

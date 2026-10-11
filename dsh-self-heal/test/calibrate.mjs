@@ -26,7 +26,9 @@ import {
   SENTENCE_LOOP_DEFAULTS,
   createRepeatDetector,
   createSentenceLoopDetector,
+  detectUnfinished,
 } from '../lib/detect.js'
+import { fenceStraddlingReport, multiBlockReport, variedCodeLines } from './harness.mjs'
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 一、样本集
@@ -187,6 +189,15 @@ function cleanSamples() {
     }
     out.push({ name: '中文散文', text: paras.join('\n') })
   }
+
+  // 16. ★ 长报告，内含代码块（2026-10-11 真实事故形态）
+  //     当时被判成「代码块没写完」，根因是判定窗口的起点落在代码块**内部** ——
+  //     窗口里那个 ``` 其实是闭围栏。这一条留在正常样本里：谁把修复回滚了，
+  //     下面「未完成线」那一格的误判数就会立刻从 0 变成 1。
+  out.push({ name: '长报告含代码块（窗口劈开）', text: fenceStraddlingReport() })
+
+  // 17. 多代码块的长报告：真实助手回复最常见的形态（同样是一道回归防线）
+  out.push({ name: '多代码块长报告', text: multiBlockReport() })
 
   return out
 }
@@ -473,7 +484,61 @@ for (const [label, overrides] of loosened) {
 
 console.log('')
 console.log('='.repeat(88))
-console.log('四、怎么读这张表')
+console.log('四、未完成线：「说了一半就停」会不会误伤正常输出')
+console.log('='.repeat(88))
+console.log('  这条线不熔断，只投一条提醒（外加一次压缩），但一样是打扰 —— 误判同样要求 0。')
+console.log('')
+
+/** 未完成线的正例：这些**应该**被接上。 */
+function unfinishedPositives() {
+  return [
+    { name: '被长度上限截断', finishKind: 'max-tokens', text: '写到一半的正文' },
+    { name: '代码块没闭合', finishKind: 'stop', text: '改法如下：\n```js\nconst a = 1\n' },
+    { name: '停在逗号上', finishKind: 'stop', text: '这个函数的作用是把输入转换成输出，' },
+    { name: '停在冒号上', finishKind: 'stop', text: '结论如下：' },
+    { name: '「我先去确认一下」', finishKind: 'stop', text: '先确认 README 第二节的真实设置项，避免我写的新表与它不符。' },
+    { name: '英文 Let me …', finishKind: 'stop', text: 'Let me run the tests.' },
+    { name: '长报告·真没闭合', finishKind: 'stop', text: '改法如下：\n```js\n' + variedCodeLines(400) },
+  ]
+}
+
+const unfinishedFalseAlarms = []
+for (const sample of clean) {
+  const hit = detectUnfinished('stop', sample.text)
+  if (hit !== null) unfinishedFalseAlarms.push(sample.name + ' → ' + hit.reason)
+}
+
+const positives = unfinishedPositives()
+const missedPositives = []
+for (const sample of positives) {
+  if (detectUnfinished(sample.finishKind, sample.text) === null) missedPositives.push(sample.name)
+}
+
+console.log('  ' + '项目'.padEnd(22) + '样本'.padStart(6) + '   结果')
+console.log(
+  '  ' +
+    '正常样本误判'.padEnd(20) +
+    String(clean.length).padStart(6) +
+    '   ' +
+    (unfinishedFalseAlarms.length === 0 ? '0 条 ✓' : String(unfinishedFalseAlarms.length) + ' 条 ✗'),
+)
+for (const line of unfinishedFalseAlarms) console.log('        ↳ ' + line)
+console.log(
+  '  ' +
+    '正例接上'.padEnd(22) +
+    String(positives.length).padStart(6) +
+    '   ' +
+    String(positives.length - missedPositives.length) +
+    ' 条' +
+    (missedPositives.length === 0 ? ' ✓' : '（漏：' + missedPositives.join('、') + '）'),
+)
+console.log('')
+console.log('  注：缓冲被截断（`bufferTruncated`）时围栏判据会主动让位 ——')
+console.log('      那时「从代码块之外数起」的前提不成立，宁可漏判，也不把闭围栏当开围栏。')
+
+console.log('')
+console.log('='.repeat(88))
+console.log('五、怎么读这张表')
 console.log('='.repeat(88))
 console.log('  · A 组「误报」那一列必须永远是 0 —— 任何一格非零，说明那组参数会误伤正常输出，')
 console.log('    不管它的漏报多低都不该采用。')
