@@ -56,16 +56,34 @@ node "$env:LOCALAPPDATA\npm-cache\_npx\1e7f6d9597241db0\node_modules\@deepseek-a
 
 ## 路径发现
 
-后端按以下顺序自动定位，可用环境变量覆盖：
+RimCrow 的数据目录**不固定在** `%LOCALAPPDATA%\RimCrow` —— 它可以装在任意位置
+（本机就是 `桌面\其他杂项\游戏和模组启动器及管理工具\RimModManager`）。
+因此后端按下面的顺序逐级探测，判定条件是**该目录下存在 `data\mod_manager.db`**：
 
-1. `RIMCROW_HOME` → 否则依次尝试
-   `<RimCrow 安装目录>`、
-   `<RimCrow 安装目录>`、`%LOCALAPPDATA%\RimCrow`、`%APPDATA%\RimCrow`
-   （判定条件：目录下存在 `data\mod_manager.db`）
-2. RimWorld 用户目录：`RIMWORLD_USER_DIR` → `data\profiles\<档案>\profile.json` 的 `user_data_path`
-   → 默认 `%USERPROFILE%\AppData\LocalLow\Ludeon Studios\RimWorld by Ludeon Studios`
+1. `RIMCROW_HOME` 环境变量（显式指定，最高优先）
+2. 缓存文件 `%USERPROFILE%\.dsh\rimcrow-tools\home.txt`（上次探测成功的结果，命中即返回）
+3. 常见安装位：`%LOCALAPPDATA%\RimCrow`、`%APPDATA%\RimCrow`、
+   `%LOCALAPPDATA%\Programs\RimCrow`、`%ProgramFiles%\RimCrow`、
+   `%ProgramFiles%\RimModManager`、`%ProgramFiles(x86)%\RimCrow`
+4. **正在运行的 `RimCrow` 进程**：取其可执行文件路径的父目录（最准，需要起一次 PowerShell，超时 6 秒）
+5. `Desktop` / `OneDrive\Desktop` / `Public\Desktop` 下的浅层扫描（最多 3 层）
+
+第 4、5 步命中后会写回缓存文件，之后每次调用直接命中，单次约 70–120 ms。
+若 RimCrow 换了位置，把 `home.txt` 删掉或改内容即可，下次自动重新探测；
+也可以用 `RIMCROW_HOME` 或 `RIMCROW_HOME_CACHE` 两个环境变量覆盖。
+
+RimWorld 用户目录（`ModsConfig.xml` 与实时日志所在处）：
+`RIMWORLD_USER_DIR` → 档案 `profile.json` 里的 `user_data_path`
+→ 默认 `%USERPROFILE%\AppData\LocalLow\Ludeon Studios\RimWorld by Ludeon Studios`。
 
 SQLite 一律以 `readOnly: true` 打开；若 WAL 模式下只读打开不可用会退化为普通连接（仍不执行任何写操作）。
+
+## 已知数据口径
+
+- `modasset` 里同一 `packageId` 可能有多条记录（本地副本 / 工坊 / 多个版本目录），
+  `search_mods` 按 `packageId` 去重后再输出。
+- 「启用中 / 已停用」以 `ModsConfig.xml` 的 `activeMods` 为准，**不是** `modasset.disabled`
+  （后者实测恒为 0，不可用于判断）。读不到 `ModsConfig.xml` 时才退回 `disabled`。
 
 ## 性能
 

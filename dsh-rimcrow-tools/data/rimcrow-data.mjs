@@ -7,16 +7,32 @@
  *
  * 设计原则: 全程只读 —— 不写入、不修改任何 RimCrow / RimWorld 文件。
  */
-import { existsSync, statSync, readFileSync, openSync, readSync, closeSync, createReadStream } from 'node:fs'
+import {
+  existsSync, statSync, readFileSync, openSync, readSync, closeSync, createReadStream,
+  readdirSync, writeFileSync, mkdirSync,
+} from 'node:fs'
 import { createInterface } from 'node:readline'
-import { join } from 'node:path'
+import { join, dirname } from 'node:path'
+import { execFileSync } from 'node:child_process'
 import { DatabaseSync } from 'node:sqlite'
 
 // ---------------------------------------------------------------- 路径发现
+// RimCrow 不一定会把数据放在 %LOCALAPPDATA%\RimCrow —— 本机就是装在
+// 「桌面\...\RimModManager」这种自定义目录下。所以按下面的顺序逐级发现：
+//   ① RIMCROW_HOME 环境变量  ② 上次发现成功的缓存  ③ 常见安装位置
+//   ④ 正在运行的 RimCrow 进程路径  ⑤ Desktop 下的浅层扫描
+// 找到的目录会写入缓存，后续调用直接命中，不再重复探测。
+const HOME_CACHE = process.env.RIMCROW_HOME_CACHE
+  || join(process.env.USERPROFILE || process.env.HOME || '.', '.dsh', 'rimcrow-tools', 'home.txt')
+
 const HOME_CANDIDATES = [
   process.env.RIMCROW_HOME,
   process.env.LOCALAPPDATA ? join(process.env.LOCALAPPDATA, 'RimCrow') : null,
   process.env.APPDATA ? join(process.env.APPDATA, 'RimCrow') : null,
+  process.env.LOCALAPPDATA ? join(process.env.LOCALAPPDATA, 'Programs', 'RimCrow') : null,
+  process.env.ProgramFiles ? join(process.env.ProgramFiles, 'RimCrow') : null,
+  process.env.ProgramFiles ? join(process.env.ProgramFiles, 'RimModManager') : null,
+  process.env['ProgramFiles(x86)'] ? join(process.env['ProgramFiles(x86)'], 'RimCrow') : null,
 ].filter(Boolean)
 
 const USER_DIR_CANDIDATES = [
@@ -33,8 +49,88 @@ function firstExisting(list, probe) {
   return null
 }
 
-const HOME = firstExisting(HOME_CANDIDATES, (c) => join(c, 'data', 'mod_manager.db')) ?? HOME_CANDIDATES[0]
+/** 该目录是不是一个有效的 RimCrow 数据根（存在 data/mod_manager.db） */
+function hasDb(home) {
+  try { return !!home && existsSync(join(home, 'data', 'mod_manager.db')) } catch { return false }
+}
+
+function readCachedHome() {
+  try {
+    const t = readFileSync(HOME_CACHE, 'utf8').trim()
+    return t && hasDb(t) ? t : null
+  } catch { return null }
+}
+
+function writeCachedHome(home) {
+  try {
+    mkdirSync(dirname(HOME_CACHE), { recursive: true })
+    writeFileSync(HOME_CACHE, home + '\n', 'utf8')
+  } catch { }
+}
+
+/** 从正在运行的 RimCrow 进程反推安装目录（最准；进程没开就返回 null） */
+function homeFromProcess() {
+  try {
+    const out = execFileSync('powershell.exe', [
+      '-NoProfile', '-NonInteractive', '-Command',
+      '(Get-Process RimCrow -ErrorAction SilentlyContinue | Where-Object { $_.Path } | Select-Object -First 1).Path',
+    ], { encoding: 'utf8', timeout: 6000, windowsHide: true })
+    const exe = String(out || '').trim().split(/\r?\n/).map((s) => s.trim()).filter(Boolean).pop()
+    if (!exe) return null
+    const dir = dirname(exe)
+    return hasDb(dir) ? dir : null
+  } catch { return null }
+}
+
+/** 在若干根目录下做浅层 BFS，找 <dir>/data/mod_manager.db */
+function homeFromScan(roots, maxDepth) {
+  const SKIP = new Set([
+    'node_modules', '.git', '$Recycle.Bin', 'System Volume Information',
+    'Windows', 'Windows.old', 'ProgramData', 'AppData',
+  ])
+  let level = roots.filter(Boolean)
+  for (let depth = 0; depth <= maxDepth && level.length; depth++) {
+    const next = []
+    for (const dir of level) {
+      if (hasDb(dir)) return dir
+      let ents
+      try { ents = readdirSync(dir, { withFileTypes: true }) } catch { continue }
+      for (const e of ents) {
+        if (!e.isDirectory()) continue
+        const n = e.name
+        if (n.startsWith('.') || SKIP.has(n)) continue
+        next.push(join(dir, n))
+      }
+    }
+    level = next
+  }
+  return null
+}
+
+function discoverHome() {
+  if (hasDb(process.env.RIMCROW_HOME)) return process.env.RIMCROW_HOME
+  const cached = readCachedHome()
+  if (cached) return cached
+  const known = firstExisting(HOME_CANDIDATES, (c) => join(c, 'data', 'mod_manager.db'))
+  if (known) return known
+  const fromProc = homeFromProcess()
+  if (fromProc) { writeCachedHome(fromProc); return fromProc }
+  const desktops = [
+    process.env.USERPROFILE ? join(process.env.USERPROFILE, 'Desktop') : null,
+    process.env.OneDrive ? join(process.env.OneDrive, 'Desktop') : null,
+    process.env.PUBLIC ? join(process.env.PUBLIC, 'Desktop') : null,
+  ]
+  const scanned = homeFromScan(desktops, 3)
+  if (scanned) { writeCachedHome(scanned); return scanned }
+  return null
+}
+
+const DISCOVERED_HOME = discoverHome()
+const HOME = DISCOVERED_HOME ?? HOME_CANDIDATES[0]
 const DATA = join(HOME, 'data')
+const HOME_HINT = DISCOVERED_HOME
+  ? DISCOVERED_HOME
+  : `未找到（试过: ${HOME_CANDIDATES.join(' | ')}；可设 RIMCROW_HOME 环境变量指定）`
 
 // ---------------------------------------------------------------- 小工具
 function jparse(s, fallback) {
@@ -84,6 +180,26 @@ function userDir() {
   } catch { }
   _userDir = firstExisting(USER_DIR_CANDIDATES, (c) => join(c, 'Config', 'ModsConfig.xml')) ?? USER_DIR_CANDIDATES[0]
   return _userDir
+}
+
+/** ModsConfig.xml 的 activeMods 集合（用于判断「启用中」；读不到时退回 disabled 字段） */
+let _activeIds = null
+function activeIdSet() {
+  if (_activeIds) return _activeIds
+  const set = new Set()
+  try {
+    const xml = readFileSync(join(userDir(), 'Config', 'ModsConfig.xml'), 'utf8')
+    const block = (/<activeMods>([\s\S]*?)<\/activeMods>/.exec(xml) || [])[1] || ''
+    for (const m of block.matchAll(/<li>([^<]+)<\/li>/g)) set.add(m[1].trim().toLowerCase())
+  } catch { }
+  _activeIds = set
+  return set
+}
+
+function isEnabled(packageId, disabledFlag) {
+  const set = activeIdSet()
+  if (!set.size) return disabledFlag !== 1
+  return set.has(String(packageId || '').toLowerCase())
 }
 
 function readTailText(file, maxBytes) {
@@ -190,7 +306,7 @@ actions.get_mod_info = (args) => {
   const query = String(args.query || '').trim()
   if (!query) throw new Error('请提供 query 参数（packageId、工坊 ID 或名称关键词）')
   const db = openDb(join(DATA, 'mod_manager.db'))
-  if (!db) throw new Error('无法打开 mod_manager.db')
+  if (!db) throw new Error(`无法打开 mod_manager.db（RimCrow 数据目录: ${HOME_HINT}）`)
   const like = '%' + query.replace(/[%_]/g, (m) => '\\' + m) + '%'
   const rows = db.prepare("SELECT * FROM modasset WHERE package_id = ?1 OR package_id_raw = ?1 OR workshop_id = ?1 OR package_id LIKE ?2 ESCAPE '\\' OR name LIKE ?2 ESCAPE '\\' ORDER BY name LIMIT 12").all(query, like)
   const users = new Map()
@@ -360,7 +476,14 @@ actions.search_mods = (args) => {
       installed.set(String(r.package_id).toLowerCase(), r)
     }
     if (scope !== 'workshop') {
-      for (const r of mgr.prepare("SELECT package_id, name, author, workshop_id, source, store, disabled, supported_versions FROM modasset WHERE name LIKE ?1 ESCAPE '\\' OR package_id LIKE ?1 ESCAPE '\\' OR workshop_id LIKE ?1 ESCAPE '\\' ORDER BY name LIMIT ?2").all(like, limit)) {
+      // modasset 里同一 packageId 可能有多条路径记录（本地副本 / 工坊 / 多版本目录），
+      // 这里按 packageId 去重，否则搜索结果会出现重复条目。
+      const seen = new Set()
+      for (const r of mgr.prepare("SELECT package_id, name, author, workshop_id, source, store, disabled, supported_versions FROM modasset WHERE name LIKE ?1 ESCAPE '\\' OR package_id LIKE ?1 ESCAPE '\\' OR workshop_id LIKE ?1 ESCAPE '\\' ORDER BY name LIMIT ?2").all(like, limit * 4)) {
+        const key = String(r.package_id || '').toLowerCase()
+        if (seen.has(key)) continue
+        seen.add(key)
+        if (results.length >= limit) break
         results.push({
           origin: 'installed',
           packageId: r.package_id,
@@ -369,7 +492,7 @@ actions.search_mods = (args) => {
           workshopId: r.workshop_id,
           source: r.source,
           store: r.store,
-          enabled: r.disabled !== 1,
+          enabled: isEnabled(r.package_id, r.disabled),
           versions: jparse(r.supported_versions, []),
         })
       }
@@ -411,7 +534,7 @@ actions.search_mods = (args) => {
 /** 5. 分组模组 —— groupdata + groupmod */
 actions.get_group_mods = (args) => {
   const db = openDb(join(DATA, 'mod_manager.db'))
-  if (!db) throw new Error('无法打开 mod_manager.db')
+  if (!db) throw new Error(`无法打开 mod_manager.db（RimCrow 数据目录: ${HOME_HINT}）`)
   const groups = db.prepare('SELECT * FROM groupdata ORDER BY sort_index').all()
   const members = db.prepare('SELECT * FROM groupmod ORDER BY sort_index').all()
   const names = new Map()
@@ -450,7 +573,7 @@ actions.get_group_mods = (args) => {
 /** 6. 模组用户数据 —— usermoddata 表 */
 actions.get_mod_user_data = (args) => {
   const db = openDb(join(DATA, 'mod_manager.db'))
-  if (!db) throw new Error('无法打开 mod_manager.db')
+  if (!db) throw new Error(`无法打开 mod_manager.db（RimCrow 数据目录: ${HOME_HINT}）`)
   const rows = db.prepare('SELECT * FROM usermoddata').all()
   const names = new Map()
   for (const r of db.prepare('SELECT package_id, name FROM modasset').all()) names.set(String(r.package_id).toLowerCase(), r.name)

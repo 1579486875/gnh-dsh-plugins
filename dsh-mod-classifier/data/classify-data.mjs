@@ -14,19 +14,29 @@
  * 设计原则：对 RimCrow / RimWorld 数据**全程只读**；唯一会写的是本插件自带的
  * rules/rules.json（分类规则表），它不属于 RimCrow 数据。
  */
-import { existsSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync, writeFileSync, readdirSync, mkdirSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { execFileSync } from 'node:child_process'
 import { DatabaseSync } from 'node:sqlite'
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)))
 const RULES_PATH = join(ROOT, 'rules', 'rules.json')
 
 // ---------------------------------------------------------------- 路径发现
+// RimCrow 数据目录不固定；按「环境变量 → 缓存 → 已知位置 → 运行中进程 → Desktop 扫描」逐级发现。
+const HOME_CACHE = process.env.RIMCROW_HOME_CACHE
+  || join(process.env.USERPROFILE || process.env.HOME || '.', '.dsh', 'rimcrow-tools', 'home.txt')
+
 const HOME_CANDIDATES = [
   process.env.RIMCROW_HOME,
+  // 本机历史安装位置（桌面便携版）——保留作为已知候选，不再作为唯一来源
+  'C:\\Users\\asus\\Desktop\\其他杂项\\游戏和模组启动器及管理工具\\RimModManager',
   process.env.LOCALAPPDATA ? join(process.env.LOCALAPPDATA, 'RimCrow') : null,
   process.env.APPDATA ? join(process.env.APPDATA, 'RimCrow') : null,
+  process.env.LOCALAPPDATA ? join(process.env.LOCALAPPDATA, 'Programs', 'RimCrow') : null,
+  process.env.ProgramFiles ? join(process.env.ProgramFiles, 'RimCrow') : null,
+  process.env.ProgramFiles ? join(process.env.ProgramFiles, 'RimModManager') : null,
 ].filter(Boolean)
 
 function firstExisting(list, probe) {
@@ -36,7 +46,70 @@ function firstExisting(list, probe) {
   return null
 }
 
-const HOME = firstExisting(HOME_CANDIDATES, (c) => join(c, 'data', 'mod_manager.db')) ?? HOME_CANDIDATES[0]
+function hasDb(home) {
+  try { return !!home && existsSync(join(home, 'data', 'mod_manager.db')) } catch { return false }
+}
+
+function readCachedHome() {
+  try { const t = readFileSync(HOME_CACHE, 'utf8').trim(); return t && hasDb(t) ? t : null } catch { return null }
+}
+
+function writeCachedHome(home) {
+  try { mkdirSync(dirname(HOME_CACHE), { recursive: true }); writeFileSync(HOME_CACHE, home + '\n', 'utf8') } catch { }
+}
+
+function homeFromProcess() {
+  try {
+    const out = execFileSync('powershell.exe', [
+      '-NoProfile', '-NonInteractive', '-Command',
+      '(Get-Process RimCrow -ErrorAction SilentlyContinue | Where-Object { $_.Path } | Select-Object -First 1).Path',
+    ], { encoding: 'utf8', timeout: 6000, windowsHide: true })
+    const exe = String(out || '').trim().split(/\r?\n/).map((s) => s.trim()).filter(Boolean).pop()
+    if (!exe) return null
+    const dir = dirname(exe)
+    return hasDb(dir) ? dir : null
+  } catch { return null }
+}
+
+function homeFromScan(roots, maxDepth) {
+  const SKIP = new Set(['node_modules', '.git', '$Recycle.Bin', 'System Volume Information', 'Windows', 'Windows.old', 'AppData'])
+  let level = roots.filter(Boolean)
+  for (let depth = 0; depth <= maxDepth && level.length; depth++) {
+    const next = []
+    for (const dir of level) {
+      if (hasDb(dir)) return dir
+      let ents
+      try { ents = readdirSync(dir, { withFileTypes: true }) } catch { continue }
+      for (const e of ents) {
+        if (!e.isDirectory()) continue
+        const n = e.name
+        if (n.startsWith('.') || SKIP.has(n)) continue
+        next.push(join(dir, n))
+      }
+    }
+    level = next
+  }
+  return null
+}
+
+function discoverHome() {
+  if (hasDb(process.env.RIMCROW_HOME)) return process.env.RIMCROW_HOME
+  const cached = readCachedHome()
+  if (cached) return cached
+  const known = firstExisting(HOME_CANDIDATES, (c) => join(c, 'data', 'mod_manager.db'))
+  if (known) return known
+  const fromProc = homeFromProcess()
+  if (fromProc) { writeCachedHome(fromProc); return fromProc }
+  const scanned = homeFromScan([
+    process.env.USERPROFILE ? join(process.env.USERPROFILE, 'Desktop') : null,
+    process.env.OneDrive ? join(process.env.OneDrive, 'Desktop') : null,
+    process.env.PUBLIC ? join(process.env.PUBLIC, 'Desktop') : null,
+  ], 3)
+  if (scanned) { writeCachedHome(scanned); return scanned }
+  return null
+}
+
+const HOME = discoverHome() ?? HOME_CANDIDATES[0]
 const DATA = join(HOME, 'data')
 
 // ---------------------------------------------------------------- 小工具
@@ -109,7 +182,18 @@ function loadMods() {
   const file = join(DATA, 'mod_manager.db')
   const db = openDb(file)
   if (!db) throw new Error('无法打开 RimCrow 数据库：' + file)
-  const mods = db.prepare('SELECT package_id, package_id_raw, name, author, description, workshop_id, source, store, state, disabled, mod_type FROM modasset').all()
+  // modasset 里同一 packageId 可能有多条路径记录（本地副本 / 工坊 / 多版本目录）。
+  // 这里按 packageId 归并，只留信息最全的一条，否则列表里会出现重复条目。
+  const score = (x) => (x.state === 'present' ? 4 : 0) + (x.disabled === 0 ? 2 : 0) + (x.description ? 1 : 0)
+  const rows = db.prepare('SELECT package_id, package_id_raw, name, author, description, workshop_id, source, store, state, disabled, mod_type FROM modasset').all()
+  const byPid = new Map()
+  for (const r of rows) {
+    const key = String(r.package_id || '').toLowerCase()
+    if (!key) continue
+    const prev = byPid.get(key)
+    if (!prev || score(r) > score(prev)) byPid.set(key, r)
+  }
+  const mods = [...byPid.values()]
   const alias = new Map()
   try {
     for (const r of db.prepare('SELECT mod_id, alias_name FROM usermoddata').all()) {
